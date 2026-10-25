@@ -1,0 +1,19 @@
+# Secrets - never commit these
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# macOS
+.DS_Store
+# Generated at runtime
+last_update_id.txt
+last_update_id.test.txt
+# Google service account key - never commit
+service-account.json
+# Belt and braces: Google downloads keys with random filenames, so ignore
+# every .json here. If you ever truly need to commit one, use:
+#   git add -f thatfile.json
+*.json

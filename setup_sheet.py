@@ -8,6 +8,8 @@ anything that already exists is skipped.
   to the current layout (the Entry column)
 - Activity Log: adds an Event ID column (empty), the link to Google Calendar events
 - Adds the hidden Calendar titles tab: per-title decisions for calendar events
+- Adds the hidden Agent state tab: the bot's state between GitHub Actions runs
+  (state.py); its later writes are not logged in Changes
 
 Each step is logged as one summary row per column in Changes, and all of it
 is sent as one all-or-nothing request.
@@ -18,6 +20,7 @@ Run with:  .venv/bin/python setup_sheet.py
 import agent
 import calendar_sync
 import sheet_writer
+import state
 from sheet_writer import CHANGES, CHANGES_HEADER, cell, log_row, update_cells
 
 REASON = "Setup for agent writes"
@@ -112,6 +115,23 @@ def main():
             }})
         logs.append(log_row(calendar_sync.TITLES_TAB, "", "", "(tab)", "", "created (hidden)", REASON))
         print(f"Adding the hidden {calendar_sync.TITLES_TAB} tab.")
+
+    if state.TAB not in writer.sheet_ids:
+        taken = list(writer.sheet_ids.values()) + [changes_id] + [
+            r["addSheet"]["properties"]["sheetId"] for r in requests if "addSheet" in r]
+        state_id = max(taken) + 1
+        requests.append({"addSheet": {"properties": {
+            "sheetId": state_id, "title": state.TAB, "hidden": True,
+            "gridProperties": {"frozenRowCount": 1, "columnCount": state.MAX_CHUNKS + 2},
+        }}})
+        header = [{**cell(h), "userEnteredFormat": {"textFormat": {"bold": True}}} for h in state.HEADER]
+        requests.append({"updateCells": {
+            "start": {"sheetId": state_id, "rowIndex": 0, "columnIndex": 0},
+            "rows": [{"values": header}],
+            "fields": "userEnteredValue,userEnteredFormat.textFormat.bold",
+        }})
+        logs.append(log_row(state.TAB, "", "", "(tab)", "", "created (hidden)", REASON))
+        print(f"Adding the hidden {state.TAB} tab.")
 
     if not logs:
         print("Already set up, nothing to do.")

@@ -9,8 +9,6 @@ Run with:  .venv/bin/python dry_run.py "met Alex at the library today, follow up
 
 import sys
 
-import anthropic
-
 import agent
 
 TEST_MESSAGES = [
@@ -23,7 +21,7 @@ TEST_MESSAGES = [
 def main():
     notes = sys.argv[1:] or TEST_MESSAGES
     data = agent.load_sheet()
-    client = anthropic.Anthropic()
+    client = agent.make_client()
 
     for note in notes:
         print("=" * 78)

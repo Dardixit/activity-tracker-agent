@@ -21,8 +21,16 @@ Only messages from TELEGRAM_CHAT_ID are handled; everyone else is ignored.
 Network errors (Telegram, Google, Claude) never stop the bot: they are logged
 in one line and the call is tried again, waiting longer each time (retry.py).
 
-Run with:  .venv/bin/python bot.py
-Stop with: Ctrl+C
+Run with:  .venv/bin/python bot.py          (keeps polling; Ctrl+C to stop)
+      or:  .venv/bin/python bot.py --once   (one-shot, for GitHub Actions: handle
+           what is waiting, run the calendar check and the OKR recount, exit;
+           exits with status 1 if anything went wrong)
+Options:   --reason-prefix "test: "         (put in front of every Changes reason)
+           --force                          (poll even if the Agent state tab says
+                                             GitHub Actions runs the bot)
+
+Where the Telegram offset, open questions and calendar state live is set by
+STATE_BACKEND (state.py): local files by default, the Agent state tab with "sheet".
 """
 
 import json
@@ -33,7 +41,6 @@ import sys
 import traceback
 from pathlib import Path
 
-import anthropic
 import requests
 from dotenv import load_dotenv
 
@@ -42,6 +49,7 @@ import calendar_sync
 import okr
 import retry
 import sheet_writer
+import state
 
 # Load the TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID variables out of the .env file.
 load_dotenv()
@@ -86,6 +94,9 @@ PENDING_FILE = Path(__file__).with_name("pending_questions.json")
 CALENDAR_EVERY = 3600
 CALENDAR_SYNC = os.getenv("CALENDAR_SYNC", "").strip().lower() == "on"
 calendar_active = False  # set by main(): whether this bot runs calendar checks
+# What went wrong in this run (handled errors included), so --once can exit
+# with status 1 and GitHub Actions reports the run as failed.
+run_errors = []
 
 HERE = Path(__file__).parent
 
@@ -119,22 +130,35 @@ def code_version():
 
 
 def load_offset():
+    if state.in_sheet():
+        return int(state.store().get("telegram_offset", 0))
     if OFFSET_FILE.exists():
         return int(OFFSET_FILE.read_text().strip() or 0)
     return 0
 
 
 def save_offset(update_id):
+    if state.in_sheet():
+        state.store().put({"telegram_offset": update_id})
+        return
     OFFSET_FILE.write_text(str(update_id))
 
 
 def load_questions():
+    if state.in_sheet():
+        return {k.split(":", 1)[1]: q for k, q in state.store().items("question:").items()}
     if PENDING_FILE.exists():
         return json.loads(PENDING_FILE.read_text())
     return {}
 
 
 def save_questions(questions):
+    if state.in_sheet():
+        # One row per question: write the new and changed ones, blank the answered ones.
+        old = state.store().items("question:")
+        new = {f"question:{mid}": q for mid, q in questions.items()}
+        state.store().put({**{k: None for k in old if k not in new}, **new})
+        return
     PENDING_FILE.write_text(json.dumps(questions, ensure_ascii=False))
 
 
@@ -201,6 +225,7 @@ def send(chat_id, text, question=None, buttons=None):
     reply = telegram("sendMessage", data)
     if not reply.get("ok"):
         print(f"Could not send reply: {reply.get('description')}")
+        run_errors.append(f"Telegram sendMessage: {reply.get('description')}")
         return None
     message_id = reply["result"]["message_id"]
     if question is not None:
@@ -400,6 +425,7 @@ def handle_tap(client, writer, callback):
         send(chat_id, f"Nothing was written: {err}")
     except Exception as err:
         traceback.print_exc()
+        run_errors.append(f"button tap: {type(err).__name__}: {err}")
         send(chat_id, f"Something went wrong: {type(err).__name__}: {err}\n"
                       "Check the Changes tab for anything that was already written.")
 
@@ -440,6 +466,7 @@ def handle(client, writer, message):
         reply, new_question = f"Nothing was written: {err}\nSend it again if it still applies.", None
     except Exception as err:
         traceback.print_exc()
+        run_errors.append(f"message: {type(err).__name__}: {err}")
         reply, new_question = (
             f"Something went wrong: {type(err).__name__}: {err}\n"
             "Check the Changes tab for anything that was already written."
@@ -468,18 +495,90 @@ def run_calendar(client, writer, chat_id=None):
               f"{len(plan['moves'])} moved, {len(plan['questions'])} question(s).")
     except Exception as err:
         traceback.print_exc()
+        run_errors.append(f"calendar check: {type(err).__name__}: {err}")
         send(chat_id, f"The calendar check failed: {type(err).__name__}: {err}\nIt will run again in an hour.")
 
 
-def main(reason_prefix="", calendar=None):
-    """Poll Telegram and handle messages until Ctrl+C.
+def recount_okrs(writer, chat_id=None):
+    """The OKR recount at the end of a one-shot run (it also runs after every
+    write); a change, such as a new month column, is reported on Telegram."""
+    try:
+        okr_edits, logged = okr.recount(writer)
+        if okr_edits:
+            send(chat_id or ALLOWED_CHAT_ID, okr.describe(okr_edits) + "\n" + sheet_writer.logged_text(logged))
+    except sheet_writer.WriteRefused as err:
+        print(f"OKR recount skipped: {err}")
+    except Exception as err:
+        traceback.print_exc()
+        run_errors.append(f"OKR recount: {type(err).__name__}: {err}")
+
+
+def handle_update(client, writer, update):
+    """One Telegram update from getUpdates: a button tap or a message."""
+    callback = update.get("callback_query")
+    if callback:
+        chat_id = callback.get("message", {}).get("chat", {}).get("id")
+        if chat_id != ALLOWED_CHAT_ID or callback.get("from", {}).get("id") != ALLOWED_CHAT_ID:
+            print(f"Ignored a button tap from chat {chat_id}.")
+            return
+        handle_tap(client, writer, callback)
+        return
+
+    # Edited messages are skipped: re-running the agent on an edit
+    # would propose the same change twice.
+    message = update.get("message")
+    if not message:
+        return
+    chat_id = message.get("chat", {}).get("id")
+    if chat_id != ALLOWED_CHAT_ID:
+        print(f"Ignored a message from chat {chat_id}.")
+        return
+    handle(client, writer, message)
+
+
+# A one-shot run fetches at most this many batches of updates (100 each).
+ONCE_MAX_BATCHES = 20
+
+
+def run_once(client, writer, calendar):
+    """Handle every waiting update, run the calendar check and the OKR
+    recount, then return. Returns the number of updates handled."""
+    offset, handled = load_offset(), 0
+    for _ in range(ONCE_MAX_BATCHES):
+        # timeout=0: answer at once, also when nothing is waiting.
+        response = retry.call("Telegram getUpdates", lambda: requests.get(
+            f"{API}/getUpdates", params={"offset": offset, "timeout": 0}, timeout=30).json())
+        if not response.get("ok"):
+            raise RuntimeError(f"Telegram getUpdates: {response.get('description')}")
+        if not response["result"]:
+            break
+        for update in response["result"]:
+            # Saved before handling, as in the polling loop.
+            offset = update["update_id"] + 1
+            save_offset(offset)
+            handle_update(client, writer, update)
+            handled += 1
+    if calendar:
+        run_calendar(client, writer)
+    recount_okrs(writer)
+    return handled
+
+
+def main(reason_prefix="", calendar=None, once=False, force=False):
+    """Poll Telegram and handle messages until Ctrl+C, or with once=True
+    handle what is waiting and return (see run_once).
 
     test_bot.py runs this same function with Telegram faked and
     reason_prefix="test: ", so tests go through exactly this code.
     calendar overrides CALENDAR_SYNC (tests turn it off or on).
+    force=True polls even if the Agent state tab says GitHub Actions runs the
+    bot (two pollers would take each other's messages).
     """
     global calendar_active
     calendar = calendar_active = CALENDAR_SYNC if calendar is None else calendar
+    if not once and not force and state.runner_in_sheet() == "github-actions":
+        sys.exit("GitHub Actions runs this bot now (Agent state tab, key \"runner\").\n"
+                 "Polling here as well would take its messages. Use --force only if Actions is switched off.")
     # Confirm the token works and show which bot we are connected to.
     # Tried until Telegram answers: a network error at start must not stop the bot.
     me = retry.call("Telegram getMe", lambda: requests.get(f"{API}/getMe", timeout=30).json(), attempts=10**9)
@@ -488,14 +587,22 @@ def main(reason_prefix="", calendar=None):
     print(f"Connected as @{me['result']['username']}. Only answering chat {ALLOWED_CHAT_ID}.")
     print(f"Writing to the {agent.sheets.SHEET_TARGET} Sheet ({agent.sheets.SHEET_ID}).")
     print(f"Code version: {code_version()}")
-    print(f"Calendar check: {'on, every hour' if calendar else 'off (set CALENDAR_SYNC=on to turn it on)'}")
-    print("Waiting for messages (Ctrl+C to stop).")
+    print(f"Calendar check: {'on' if calendar else 'off (set CALENDAR_SYNC=on to turn it on)'}")
+    print(f"State: {'Agent state tab' if state.in_sheet() else 'local files'}")
 
-    client = anthropic.Anthropic()
+    client = agent.make_client()
     writer = sheet_writer.Writer()
     writer.reason_prefix = reason_prefix
-    offset = load_offset()
     migrate_batches(ALLOWED_CHAT_ID)
+    if once:
+        handled = run_once(client, writer, calendar)
+        print(f"\nOne-shot run done: {handled} update(s) handled, {len(run_errors)} problem(s).")
+        for problem in run_errors:
+            print(f"  {problem}")
+        return 1 if run_errors else 0
+
+    print("Waiting for messages (Ctrl+C to stop).")
+    offset = load_offset()
     next_calendar = 0  # run at start
     failures = 0  # getUpdates failures in a row
 
@@ -534,30 +641,17 @@ def main(reason_prefix="", calendar=None):
             # not retried forever.
             offset = update["update_id"] + 1
             save_offset(offset)
+            handle_update(client, writer, update)
 
-            callback = update.get("callback_query")
-            if callback:
-                chat_id = callback.get("message", {}).get("chat", {}).get("id")
-                if chat_id != ALLOWED_CHAT_ID or callback.get("from", {}).get("id") != ALLOWED_CHAT_ID:
-                    print(f"Ignored a button tap from chat {chat_id}.")
-                    continue
-                handle_tap(client, writer, callback)
-                continue
 
-            # Edited messages are skipped: re-running the agent on an edit
-            # would propose the same change twice.
-            message = update.get("message")
-            if not message:
-                continue
-            chat_id = message.get("chat", {}).get("id")
-            if chat_id != ALLOWED_CHAT_ID:
-                print(f"Ignored a message from chat {chat_id}.")
-                continue
-            handle(client, writer, message)
+def option(args, name):
+    """The value after `name` in the command line, or ""."""
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else ""
 
 
 if __name__ == "__main__":
+    args = sys.argv[1:]
     try:
-        main()
+        sys.exit(main(reason_prefix=option(args, "--reason-prefix"), once="--once" in args, force="--force" in args))
     except KeyboardInterrupt:
         print("\nStopped.")

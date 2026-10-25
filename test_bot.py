@@ -17,7 +17,10 @@ starting with "test:"), so buttons can be tested without real events.
 Writes go to the target Sheet like real messages, but every Changes row they
 produce has "test: " in front of its reason. The Telegram offset and open
 test questions are kept in their own files, so the live bot's are never touched.
-The calendar check is off unless --calendar is given.
+The test files are used whatever STATE_BACKEND says, so a test never touches
+the Agent state tab either. The calendar check is off unless --calendar is
+given. --once runs the bot's one-shot mode (bot.py --once, as on GitHub
+Actions) instead of the polling loop: all test messages are waiting at once.
 At the end, every message that was sent is listed.
 
 Run with:  .venv/bin/python test_bot.py "first test message" "reply: an answer"
@@ -50,9 +53,10 @@ class FakeResponse:
 class FakeTelegram:
     """Stands in for the requests module inside bot.py."""
 
-    def __init__(self, messages):
+    def __init__(self, messages, once=False):
         # One update per poll, like messages sent a few seconds apart.
         self.messages = list(messages)
+        self.once = once
         self.next_update = 900000
         self.next_message_id = 500000
         self.last_question = None  # id of the latest bot message that was stored as a question
@@ -64,6 +68,8 @@ class FakeTelegram:
             return FakeResponse({"ok": True, "result": {"username": "test-bot (Telegram faked)"}})
         if url.endswith("/getUpdates"):
             if not self.messages:
+                if self.once:
+                    return FakeResponse({"ok": True, "result": []})  # nothing more waiting
                 raise KeyboardInterrupt  # every test message handled: stop the bot loop
             text = self.messages.pop(0)
             self.next_update += 1
@@ -109,13 +115,15 @@ class FakeTelegram:
 def main(args):
     calendar = "--calendar" in args
     test_questions = "--test-questions" in args
-    messages = [a for a in args if a not in ("--calendar", "--test-questions")]
+    once = "--once" in args
+    messages = [a for a in args if a not in ("--calendar", "--test-questions", "--once")]
     if not messages and not calendar:
         sys.exit(__doc__)
     here = Path(__file__).parent
     bot.OFFSET_FILE = here / "last_update_id.test.txt"
     bot.PENDING_FILE = here / "pending_questions.test.json"
-    telegram = bot.requests = FakeTelegram(messages)
+    bot.state.BACKEND = "files"
+    telegram = bot.requests = FakeTelegram(messages, once)
     real_send = bot.send
 
     def send(chat_id, text, question=None, buttons=None):
@@ -134,7 +142,9 @@ def main(args):
     if test_questions:
         bot.send_calendar_questions(bot.ALLOWED_CHAT_ID, TEST_QUESTIONS)
     try:
-        bot.main(reason_prefix="test: ", calendar=calendar)
+        status = bot.main(reason_prefix="test: ", calendar=calendar, once=once, force=True)
+        if once:
+            print(f"(One-shot run exit status: {status})")
     except KeyboardInterrupt:
         pass
     finally:

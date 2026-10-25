@@ -28,8 +28,8 @@ DESCRIPTION_LIMIT = 300
 
 
 def service():
-    key = sheets.find_key_file()
-    creds = service_account.Credentials.from_service_account_file(str(key), scopes=SCOPES)
+    info, _ = sheets.key_info()
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 

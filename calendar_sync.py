@@ -39,6 +39,7 @@ from googleapiclient.errors import HttpError
 import agent
 import calendar_source as cs
 import retry
+import state as agent_state
 import sheets
 import sheet_writer
 
@@ -51,8 +52,10 @@ CANDIDATE_DAYS = 3          # rows this many days either side are shown as possi
 MAX_TURNS = 8
 SNOOZE_DAYS = 7             # a skipped question comes back after this many days
 
-# Per-event memory that has no place in the Sheet: cancellations you said not
-# to mark, and events you said to leave out. (Ignored by git through *.json.)
+# Per-event memory that has no place in the tracker tabs: cancellations you
+# said not to mark, and events you said to leave out. Kept in this file, or in
+# the Agent state tab with STATE_BACKEND=sheet (state.py). (Ignored by git
+# through *.json.)
 STATE_FILE = Path(__file__).with_name("calendar_state.json")
 # The decisions of a practice run, waiting for approval.
 PLAN_FILE = Path(__file__).with_name("calendar_plan.json")
@@ -66,7 +69,10 @@ def title_key(title):
 
 
 def load_state():
-    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    if agent_state.in_sheet():
+        state = agent_state.store().get("calendar_state", {})
+    else:
+        state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     # snoozed: {question key: date (ISO) before which it is not asked again}
     return {"ignore_cancel": [], "ignore_event": [], "snoozed": {}, **state}
 
@@ -77,6 +83,9 @@ def snoozed(state, key):
 
 
 def save_state(state):
+    if agent_state.in_sheet():
+        agent_state.store().put({"calendar_state": state})
+        return
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1))
 
 
@@ -174,6 +183,10 @@ def question_text(item, hints=True):
     elif item["kind"] == "match":
         text = f'Is "{item["title"]}" on {item["date"]} the same as row "{item["entry"]}"?'
         hint = "(yes = same row / no = add it as a new row / skip = ask again in a week)"
+    elif item["kind"] == "same_time":
+        text = (f'Calendar event "{item["title"]}" on {item["date"]} starts at the same time as row '
+                f'"{item["entry"]}", which is already linked to the event "{item["other_title"]}". Is it the same event?')
+        hint = "(yes = same event, link it to that row / no = different event, add a row / skip = ask again in a week)"
     elif item["kind"] == "attend":
         text, hint = f'Did you attend "{item["activity"]}" ({item["date"]})?', "(yes = Done / no = Missed)"
     elif item["kind"] == "cancel":
@@ -186,7 +199,9 @@ def question_text(item, hints=True):
 
 
 # Button labels per answer. Skip is always "not now".
-BUTTONS = {"match": [("Same row", "yes"), ("New row", "no"), ("Skip", "skip")]}
+BUTTONS = {"match": [("Same row", "yes"), ("New row", "no"), ("Skip", "skip")],
+           "same_time": [("Same event, link to existing row", "yes"), ("Different event, add row", "no"),
+                         ("Skip", "skip")]}
 DEFAULT_BUTTONS = [("Yes", "yes"), ("No", "no"), ("Skip", "skip")]
 
 
@@ -288,6 +303,8 @@ Titles marked "yes" below are already decided as belonging: link or add those ev
 
 Rules:
 - Never add a row for an event that a row already covers. When in doubt between link and add, use ask_match.
+- An event that starts at the same date and time as a row already linked to another event is not added:
+  the code asks the user instead, so add_row for it returns "Not added". That is not an error.
 - Category must be one of: {agent.allowed_values(data, "Category")}.
 - Activity is a short name like the existing rows, based on the event title; Description a short phrase.
   Never put the date or time in Activity or Description: the Date column has them.
@@ -299,8 +316,10 @@ Rules:
 class Batch:
     """One model run over a list of events, collecting the decisions in `plan`."""
 
-    def __init__(self, data, events, titles, plan):
+    def __init__(self, data, events, titles, plan, starts=None):
         self.data, self.titles, self.plan = data, titles, plan
+        # {start datetime: [(row, event)]} of the events already linked to rows.
+        self.starts = starts or {}
         self.ids = {f"E{i}": e for i, e in enumerate(events, 1)}
         self.open = set(self.ids)              # events still needing a decision
         self.taken = {row for _, row, _ in plan["links"]} | {i["row"] for i in plan["questions"] if i["kind"] == "match"}
@@ -324,6 +343,16 @@ class Batch:
         return {"Date": cs.date_text(e), "Status": "Confirmed", "Category": args["category"],
                 "Activity": args["activity"].strip(), "Description": args["description"].strip() or "-",
                 "Outcome": "-"}
+
+    def same_start(self, e):
+        """(row, other event) when a row is already linked to another event
+        that starts at the same moment as e (a timed event), else None. Links
+        made earlier in this run count too."""
+        if e.get("all_day") or not e.get("start"):
+            return None
+        linked = list(self.starts.get(e["start"], []))
+        linked += [(row, other) for other, row, _ in self.plan["links"] if other.get("start") == e["start"]]
+        return next(((row, other) for row, other in linked if other["id"] != e["id"]), None)
 
     def check_fields(self, e, fields):
         change = {"action": "add", "tab": agent.ACTIVITY, "row": 0, "fields": fields}
@@ -377,6 +406,20 @@ class Batch:
             problems = self.check_fields(e, fields)
             if problems:
                 return "Rejected:\n- " + "\n- ".join(problems), True
+            # Same date and start time as a row already linked to another event:
+            # never added without asking (a calendar often holds two entries for
+            # one meeting).
+            clash = self.same_start(e)
+            if clash:
+                row, other = clash
+                r = row_dict(self.data, row)
+                self.plan["questions"].append({
+                    "kind": "same_time", "event_id": e["id"], "title": e["title"], "date": cs.date_text(e),
+                    "row": row, "entry": sheet_writer.entry_for(agent.ACTIVITY, r), "other_title": other["title"],
+                    "fields": fields})
+                self.open.discard(eid)
+                return (f"Not added: row {row} \"{r['Activity']}\" is already linked to the event "
+                        f"{other['title']!r}, which starts at the same time. The user will be asked."), False
             # A same-day row sharing a title word looks like a duplicate: make
             # the model look again once before adding.
             similar = [c for c in candidates(self.data, e, self.taken) if c["same_day"] and any(
@@ -456,6 +499,11 @@ def check(client, practice=False, open_keys=(), events=None, data=None, title_ro
     today = agent.now().date()
     by_id = {e["id"]: e for e in events}
     linked = linked_rows(data)
+    starts = {}
+    for eid, row in linked.items():
+        e = by_id.get(eid)
+        if e and not e["all_day"] and e["start"]:
+            starts.setdefault(e["start"], []).append((row, e))
 
     # 1. Events already linked to a row.
     ended_by_row = {}
@@ -506,6 +554,10 @@ def check(client, practice=False, open_keys=(), events=None, data=None, title_ro
             why = "match question skipped for now"
         elif f"match:{e['id']}" in open_keys:
             why = "match question already open"
+        elif snoozed(state, f"same_time:{e['id']}"):
+            why = "same-time question skipped for now"
+        elif f"same_time:{e['id']}" in open_keys:
+            why = "same-time question already open"
         if why:
             plan["skipped"].append((e, why))
         else:
@@ -514,7 +566,7 @@ def check(client, practice=False, open_keys=(), events=None, data=None, title_ro
     # 3. The model, in batches; titles decided "no" in one batch skip the next.
     while to_decide and client is not None:
         batch, to_decide = to_decide[:BATCH], to_decide[BATCH:]
-        Batch(data, batch, titles, plan).run(client)
+        Batch(data, batch, titles, plan, starts).run(client)
         settled = {title_key(q["title"]) for q in plan["questions"] if q["kind"] == "title"}
         still = []
         for e in to_decide:
@@ -717,12 +769,16 @@ def answer(client, writer, items, text, answers=None, numbers=None):
                 edits.append(cell_edit(data, row, "Outcome", new, "calendar: event cancelled, you answered yes"))
             else:
                 state["ignore_cancel"].append(item["event_id"])
-        elif kind == "match" and a in ("yes", "no"):
+        elif kind in ("match", "same_time") and a in ("yes", "no"):
             if a == "yes":
                 row = next((n2 for n2, v in enumerate(data[agent.ACTIVITY]["rows"], 2)
                             if sheet_writer.entry_for(agent.ACTIVITY, row_dict(data, n2)) == item["entry"]), None)
                 if row is None:
                     notes.append(f"{n}: row {item['entry']} not found any more; nothing changed.")
+                elif agent.is_locked(data, row):
+                    # Locked rows are read only: the event is left out instead of linked.
+                    state["ignore_event"].append(item["event_id"])
+                    notes.append(f"{n}: row {item['entry']} is locked, so the event is left out instead of linked.")
                 else:
                     # A multi-day row may already hold another day's event: add to it, never replace.
                     ids = row_event_ids(row_dict(data, row)) + [item["event_id"]]
@@ -881,8 +937,7 @@ if __name__ == "__main__":
         sys.exit()
     if "--practice" not in sys.argv:
         sys.exit("Run with --practice, or --apply-plan after approving a practice run.")
-    import anthropic
-    plan = check(anthropic.Anthropic(), practice=True)
+    plan = check(agent.make_client(), practice=True)
     save_plan(plan)
     print(report(plan))
     print(f"\nWould write: {len(plan['adds'])} new row(s), {len(plan['links'])} link(s), {len(plan['moves'])} "

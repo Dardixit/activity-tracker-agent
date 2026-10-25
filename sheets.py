@@ -58,26 +58,38 @@ def find_key_file():
     return None
 
 
-def load_credentials(write=False):
+def key_info():
+    """The service account key as a dict, and where it came from.
+
+    GOOGLE_SERVICE_ACCOUNT_JSON (the key file's contents, as GitHub Actions
+    passes it) wins over a key file in this folder.
+    """
+    from_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if from_env:
+        return json.loads(from_env), "GOOGLE_SERVICE_ACCOUNT_JSON"
     key_path = find_key_file()
     if key_path is None:
         sys.exit(
             "No service account key found in this folder.\n"
             "Download the JSON key from Google Cloud Console and save it here as:\n"
-            f"  {HERE / 'service-account.json'}"
+            f"  {HERE / 'service-account.json'}\n"
+            "(or put its contents in GOOGLE_SERVICE_ACCOUNT_JSON)."
         )
+    return json.loads(key_path.read_text()), key_path.name
 
-    info = json.loads(key_path.read_text())
+
+def load_credentials(write=False):
+    info, source = key_info()
     email = info.get("client_email", "<no client_email in key>")
-    print(f"Using key:   {key_path.name}")
+    print(f"Using key:   {source}")
     print(f"Robot email: {email}")
     if write:
         print(f"  -> The Sheet must be shared with this address as Editor.\n")
     else:
         print(f"  -> The Sheet must be shared with this address (Viewer is enough).\n")
 
-    creds = service_account.Credentials.from_service_account_file(
-        str(key_path), scopes=WRITE_SCOPES if write else SCOPES
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=WRITE_SCOPES if write else SCOPES
     )
     return creds, email
 

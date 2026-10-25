@@ -15,7 +15,10 @@ install packages with `uv pip install --python .venv/bin/python <package>`.
 
 | File | What it does |
 |---|---|
-| `bot.py` | The live bot: polls Telegram, runs the agent on notes, writes, replies, sends questions (one per message, with buttons), runs the calendar check at start and hourly. Restarts itself when any `.py` file changes. |
+| `bot.py` | The bot: runs the agent on Telegram notes, writes, replies, sends questions (one per message, with buttons), runs the calendar check. `--once` (GitHub Actions): handle what is waiting, calendar check, OKR recount, exit (status 1 if anything went wrong). Without it: polls, checks the calendar hourly, restarts itself when a `.py` file changes, and refuses to start while the Agent state tab says GitHub Actions runs the bot. |
+| `state.py` | Where the Telegram offset, open questions (with paused runs) and calendar state live: local files, or the hidden Agent state tab with `STATE_BACKEND=sheet`. |
+| `migrate_state.py` | One-time move of the local state files into the Agent state tab; sets runner = github-actions. |
+| `.github/workflows/agent.yml` | GitHub Actions: checks its secrets and variables (exits quietly if any is missing), then `bot.py --once` at minute 7 of 00 and 07-23 Helsinki time; manual Run workflow button (test or real Sheet). |
 | `agent.py` | The agent: prompt, tools (`search_rows`, `propose_change`, `ask_user`), the rule checks (`check_change`), pausing and continuing runs for questions, Helsinki clock (`now()`). Never writes itself. |
 | `sheet_writer.py` | All writes. One atomic `batchUpdate` per write: cell changes + their `Changes` rows. Re-reads every cell first; inserts Activity Log rows in date order; moves rows whose Date changes. |
 | `calendar_source.py` | Reads the shared Google Calendar (read-only), today to 2 months ahead, one item per occurrence. |
@@ -23,7 +26,7 @@ install packages with `uv pip install --python .venv/bin/python <package>`.
 | `okr.py` | Recounts the OKRs tab month columns after each run. |
 | `retry.py` | Retries network errors (timeouts, connection/DNS errors, HTTP 429/5xx) from Telegram, Google and Claude, waiting 2, 4, 8 ... up to 60 s. |
 | `sheets.py` | Settings (Sheet selection, tab names, categories) and Google credentials. |
-| `setup_sheet.py` | One-time Sheet setup (Locked, Source, Event ID columns; Changes tab; hidden Calendar titles tab). Safe to run again. |
+| `setup_sheet.py` | One-time Sheet setup (Locked, Source, Event ID columns; Changes tab; hidden Calendar titles and Agent state tabs). Safe to run again. |
 | `test_bot.py` | Runs `bot.main()` with Telegram faked; test writes are labelled. |
 | `revert.py` | Undoes Changes rows. |
 | `repair_rows.py` | Puts agent rows that are out of date order or lack dropdowns back in place. |
@@ -34,6 +37,8 @@ Local files that git ignores: `.env`, `service-account.json` (Google key),
 `last_update_id.txt` (Telegram offset), `pending_questions.json` (open
 questions by Telegram message id), `calendar_state.json` (snoozed/ignored
 calendar questions), `calendar_plan.json` (a practice plan awaiting approval).
+On GitHub Actions the first three live in the Agent state tab instead
+(`STATE_BACKEND=sheet`); `calendar_plan.json` stays a local, manual step.
 
 ## The Sheet
 
@@ -42,7 +47,9 @@ Description, Outcome, Locked, Source, Event ID), `Projects` (#, Project,
 Link, Started, Deadline, ...; the code relies on `#`, `Project`, `Link` and
 `Started`), `OKRs`,
 `Changes` (Timestamp, Tab, Row, Entry, Column, Old value, New value, Reason,
-Error), and the hidden `Calendar titles` (Title, Track, Decided by, Date).
+Error), the hidden `Calendar titles` (Title, Track, Decided by, Date), and
+the hidden `Agent state` (Key, Updated, Value; long values continue in the
+next columns).
 The Activity Log and Projects tab names are settings (`ACTIVITY_TAB`,
 `PROJECTS_TAB`), as is the category list (`CATEGORIES`); see `.env.example`.
 `Locked`, `Source` and `Event ID` are set by code only; the agent never sees
@@ -72,6 +79,13 @@ Most are enforced in code, not only in the prompt. Where both exist, keep both.
   person". People are the add's `people` list plus any capitalised word after
   "with"/"met". `agent.person_problem`, checked in `run_tool` (notes only, not
   calendar rows).
+- **Calendar: same start time, ask before adding.** A new timed event with the
+  same date and start time as a row already linked to another event is never
+  added: the bot asks with the buttons "Same event, link to existing row"
+  (the event's ID is added to that row; a locked row can't take it, so the
+  event is left out) / "Different event, add row" / "Skip" (asked again after
+  a week). `calendar_sync.Batch.same_start`, checked when the model calls
+  `add_row`.
 - **Done/Missed only for past dates.** Status Done or Missed is allowed only
   when the row's date (last day of a range) is today or earlier, Helsinki
   time; otherwise the agent must ask. `agent.past_status_problem`, checked in
@@ -93,7 +107,8 @@ Most are enforced in code, not only in the prompt. Where both exist, keep both.
 - **Europe/Helsinki for all dates**: the agent's "today", OKR months, Changes
   timestamps. Use `agent.now()`, never `date.today()` or `datetime.now()`.
 - **Every write is logged in `Changes` in the same atomic request.** Calendar
-  writes have reasons starting with `calendar:`.
+  writes have reasons starting with `calendar:`. The one exception: writes to
+  the Agent state tab, which is bookkeeping, not tracker data.
 - **Telegram replies are plain text**, no markdown (`bot.plain` strips it).
 - **Only chat `TELEGRAM_CHAT_ID` is answered**; everyone else is ignored,
   button taps included.
@@ -126,10 +141,32 @@ Most are enforced in code, not only in the prompt. Where both exist, keep both.
   stubbed writer, scripted fake model) over writes.
 - Commit only when asked. Commit messages end with the Co-Authored-By line.
 
+## GitHub Actions
+
+`.github/workflows/agent.yml` runs `bot.py --once` at minute 7 of 00:07 and
+07:07-23:07 Europe/Helsinki (the schedule's `timezone`), with the state in the
+Agent state tab, never two runs at once and a 6-minute limit. Its first step
+checks the required secrets and variables; if any is missing it says which
+and exits successfully, so a repository without them never fails on the
+schedule. Scheduled runs use `SCHEDULE_SHEET_TARGET` (default `test`); the
+real Sheet is refused until `REAL_SHEET_APPROVED=true`; `SCHEDULE_ENABLED=false`
+pauses the schedule. A failed run sends a Telegram message. Claude
+authenticates with Workload Identity Federation (`agent.make_client`, the
+`ANTHROPIC_*` variables); never add `ANTHROPIC_API_KEY` there, it would win
+over federation. README.md lists every secret and variable.
+
+The federation rule must match the subject GitHub actually sends, which is the
+ID-embedded format `repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main`
+(owner and repository each followed by their numeric ID), not the plain
+`repo:<owner>/<repo>:ref:...` shown in most docs. A rule written in the plain
+format fails the token exchange with `401 Authentication failed`; the reason
+is on the Console's Workload identity history page.
+
 ## How to run
 
 ```
-.venv/bin/python bot.py                          # the bot (Ctrl+C to stop)
+.venv/bin/python bot.py --once                   # one-shot run, as on GitHub Actions
+.venv/bin/python bot.py                          # polling bot (refused while Actions runs it)
 .venv/bin/python dry_run.py "met Alex today"     # agent proposal only, no writes
 .venv/bin/python setup_sheet.py                  # one-time Sheet setup
 .venv/bin/python okr.py                          # recount the OKRs tab
@@ -145,6 +182,7 @@ Most are enforced in code, not only in the prompt. Where both exist, keep both.
 .venv/bin/python test_bot.py "test: note" "reply: an answer"      # reply to the latest question
 .venv/bin/python test_bot.py --test-questions "tap:1:no" "tap:2:skip" "3. yes"   # fake calendar questions
 .venv/bin/python test_bot.py --test-questions "1 yes, 2 no" "tap:confirm:answers"
+.venv/bin/python test_bot.py --once "test: note"                 # one-shot mode
 ```
 
 `reply:3: text` replies to calendar question 3; `tap:3:yes|no|skip` taps its
@@ -171,6 +209,8 @@ Revert newer Changes rows first when the same cell changed twice.
 (default `claude-haiku-5-5`), `GOOGLE_SHEET_ID` (real Sheet),
 `GOOGLE_TEST_SHEET_ID`, `SHEET_TARGET` (`test` or `real`),
 `GOOGLE_CALENDAR_ID`, `CALENDAR_SYNC` (`on` for hourly calendar checks),
+`STATE_BACKEND` (`files` or `sheet`), `GOOGLE_SERVICE_ACCOUNT_JSON` (the key's
+contents, instead of `service-account.json`),
 `ACTIVITY_TAB` (default `Activity Log`), `PROJECTS_TAB` (default `Projects`),
 `CATEGORIES` (default `Networking,Outreach,Project,Meeting,Learning,Personal Brand,Preparation`;
 the OKR rules in `okr.py` use these names).
@@ -179,10 +219,6 @@ The bot reads `.env` at start; after changing it, restart the bot.
 ## Open items
 
 Kept in `TODO.md`:
-- Before deploying to GitHub Actions: switch Claude API auth from API key to identity federation.
-- Switching to the real Sheet: share it with the service account as Editor,
-  set `SHEET_TARGET=real`, run `setup_sheet.py` there once.
-- Before GitHub Actions: the local state files (`pending_questions.json`,
-  `calendar_state.json`, `last_update_id.txt`) need a durable home.
+- Google federation for the service account (remove service-account.json).
 - New Projects rows are appended without copying formatting from the row above.
 - OKR month headers without a year ("Aug" to "Nov") are taken as 2026 (`okr.PLAIN_MONTH_YEAR`).

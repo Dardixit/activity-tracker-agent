@@ -13,6 +13,8 @@ import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import anthropic
+import requests
 from googleapiclient.discovery import build
 
 import retry
@@ -20,6 +22,35 @@ import sheets
 
 # sheets.py has already loaded .env.
 MODEL = os.getenv("CLAUDE_MODEL", "").strip() or "claude-haiku-5-5"
+
+
+def github_identity_token():
+    """A fresh GitHub Actions OIDC token for the Claude API. Each one may be
+    exchanged only once and expires after about 5 minutes, so one is fetched
+    for every exchange instead of being read from a file."""
+    url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=https://api.anthropic.com"
+    headers = {"Authorization": f"Bearer {os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']}"}
+    reply = retry.call("GitHub OIDC token", lambda: requests.get(url, headers=headers, timeout=30))
+    reply.raise_for_status()
+    return reply.json()["value"]
+
+
+def make_client():
+    """The Claude client. On GitHub Actions with the federation variables set
+    (ANTHROPIC_FEDERATION_RULE_ID etc.), Workload Identity Federation with a
+    fresh GitHub token per exchange: no API key. Elsewhere the usual
+    environment credentials (ANTHROPIC_API_KEY when run locally)."""
+    if os.getenv("ACTIONS_ID_TOKEN_REQUEST_URL") and os.getenv("ANTHROPIC_FEDERATION_RULE_ID"):
+        return anthropic.Anthropic(credentials=anthropic.WorkloadIdentityCredentials(
+            identity_token_provider=github_identity_token,
+            federation_rule_id=os.environ["ANTHROPIC_FEDERATION_RULE_ID"],
+            organization_id=os.environ["ANTHROPIC_ORGANIZATION_ID"],
+            service_account_id=os.getenv("ANTHROPIC_SERVICE_ACCOUNT_ID") or None,
+            workspace_id=os.getenv("ANTHROPIC_WORKSPACE_ID") or None,
+        ))
+    return anthropic.Anthropic()
+
+
 ACTIVITY = sheets.ACTIVITY_TAB
 PROJECTS = sheets.PROJECTS_TAB
 # The Activity Log categories the agent may use (CATEGORIES in .env).

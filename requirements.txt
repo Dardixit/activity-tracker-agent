@@ -1,5 +1,5 @@
-requests
-python-dotenv
-google-auth
-google-api-python-client
-anthropic
+requests==2.34.2
+python-dotenv==1.2.4
+google-auth==2.62.0
+google-api-python-client==2.201.0
+anthropic==2.3.0

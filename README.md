@@ -27,7 +27,8 @@ This is a showcase copy of a personal project. Names in examples are placeholder
 
 - **Inputs.** `bot.py` long-polls Telegram for your notes and button taps. With
   `CALENDAR_SYNC=on` it also reads the calendar (`calendar_source.py`, read-only)
-  at start and then every hour.
+  at start and then every hour. On GitHub Actions it runs once an hour instead
+  (`bot.py --once`, see "Run it on GitHub Actions").
 - **Claude tool use.** `agent.py` gives the model three tools:
   - `search_rows`: finds candidate rows in both tabs.
   - `propose_change`: an `add` or `update` of named columns.
@@ -69,6 +70,10 @@ Each rule below is marked (code) when the code enforces it, or (prompt) when onl
   person whose first name is already in any row, the add is rejected until you
   have chosen "Same person, update existing row", "Same person, new row" or
   "Different person". Calendar rows use their own matching instead.
+- **Calendar: same start time, ask before adding** (code). A new calendar
+  event with the same date and start time as a row already linked to another
+  event is not added; you choose "Same event, link to existing row",
+  "Different event, add row" or "Skip".
 - **Contradictions go to you as a question** (prompt). The model is told to ask
   when a note conflicts with a row's date or status. Once it asks, the code
   drops every change from that run, so nothing is written until you answer.
@@ -83,6 +88,8 @@ Each rule below is marked (code) when the code enforces it, or (prompt) when onl
   to set its Outcome to "Cancelled". Only `revert.py` and `repair_rows.py` delete
   rows, and only rows the agent added.
 - **Every write is logged** (code) in the same atomic request as the change.
+  The one exception is the hidden `Agent state` tab, which holds the bot's
+  own bookkeeping, not tracker data.
 - **One chat only** (code). Messages and button taps from any chat other than
   `TELEGRAM_CHAT_ID` are ignored.
 - **Test Sheet by default** (code). The writer refuses to write to the real
@@ -150,3 +157,89 @@ Each rule below is marked (code) when the code enforces it, or (prompt) when onl
 `test_bot.py` runs the real bot loop with Telegram faked and labels every
 logged reason `test:`. Use `revert.py --test <Changes rows>` to undo test writes.
 `CLAUDE.md` has the full file list, rules and commands.
+
+## Run it on GitHub Actions
+
+The workflow is included: `.github/workflows/agent.yml`. It is scheduled
+hourly, at minute 7 from 07:07 to 00:07 Europe/Helsinki time (daylight saving
+time included; no runs from 01:00 to 06:59). Each run is `bot.py --once`: it
+handles the waiting Telegram messages and button taps, runs the calendar check
+and the OKR recount, and exits. What has to survive between runs (the Telegram
+offset, open questions with their paused agent runs, calendar state) is kept
+in the Sheet's hidden `Agent state` tab. Runs never overlap, each is stopped
+after 6 minutes, and a failed run sends you a Telegram message.
+
+**In this repository the workflow has no secrets.** Each scheduled run first
+checks for them, finds none, prints which ones are missing and exits without
+doing anything; the run still shows as successful. After you fork the
+repository and add your own secrets and variables, the hourly run works.
+
+### Secrets and variables
+
+| Name | Kind | Holds |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | secret, required | The bot token from @BotFather. |
+| `TELEGRAM_CHAT_ID` | secret, required | Your own chat ID; every other chat is ignored. |
+| `GOOGLE_TEST_SHEET_ID` | secret, required | The ID of the test copy of the Sheet (from its URL). |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | secret, required | The whole contents of the service account's JSON key file. |
+| `GOOGLE_SHEET_ID` | secret, required for the real Sheet | The ID of the real Sheet. |
+| `GOOGLE_CALENDAR_ID` | secret, optional | The calendar to read; the calendar check runs only when it is set. |
+| `ANTHROPIC_FEDERATION_RULE_ID` | variable, required | The federation rule (`fdrl_...`) created below. |
+| `ANTHROPIC_ORGANIZATION_ID` | variable, required | Your Anthropic organization ID (a UUID). |
+| `ANTHROPIC_SERVICE_ACCOUNT_ID` | variable, required | The service account (`svac_...`) the rule maps to. |
+| `ANTHROPIC_WORKSPACE_ID` | variable, optional | The workspace (`wrkspc_...`); needed when the rule covers more than one. |
+| `SCHEDULE_SHEET_TARGET` | variable, optional | `test` (default) or `real`: the Sheet scheduled runs use. |
+| `REAL_SHEET_APPROVED` | variable, optional | `true` allows runs on the real Sheet; until then they are refused. |
+| `SCHEDULE_ENABLED` | variable, optional | `false` pauses the scheduled runs; manual runs still work. |
+| `ACTIVITY_TAB`, `PROJECTS_TAB`, `CATEGORIES` | variables, optional | Tab names and categories, if yours differ from the defaults. |
+
+There is no `ANTHROPIC_API_KEY`: the workflow authenticates to Claude with
+workload identity federation, and a key in the environment would take
+precedence over it.
+
+### Workload identity federation for Claude
+
+1. In the Claude Console (you need the admin or owner role), open
+   **Settings > Workload identity > Connect workload** and choose
+   **GitHub Actions**. The wizard creates the issuer
+   (`https://token.actions.githubusercontent.com`), a service account and a
+   federation rule.
+2. Set the rule's match conditions. GitHub sends the token's subject in the
+   ID-embedded format, with each name followed by its numeric ID:
+   ```
+   repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main
+   ```
+   Get both IDs with `gh api repos/<owner>/<repo> --jq '.owner.id, .id'`.
+   Add the audience `https://api.anthropic.com` and the claim
+   `ref` = `refs/heads/main`, so only runs from your `main` branch get a
+   token. A rule in the plain `repo:<owner>/<repo>:ref:refs/heads/main`
+   format does not match: the run fails with `401 Authentication failed`,
+   and the Console's Workload identity history shows why.
+3. Copy the rule ID, the service account ID, your organization ID and the
+   workspace ID into the variables above.
+
+The code (`agent.make_client`) asks GitHub for a fresh identity token for
+every exchange, since each token may be used once and expires after about
+5 minutes.
+
+### Add the secrets
+
+1. Fork this repository. Run `setup_sheet.py` once on your Sheet (locally,
+   with `.env` set up) so it has the `Agent state` tab.
+2. In your fork, open **Settings > Secrets and variables > Actions**.
+3. On the **Secrets** tab, choose **New repository secret** for each secret
+   above. For `GOOGLE_SERVICE_ACCOUNT_JSON`, paste the whole key file.
+4. On the **Variables** tab, choose **New repository variable** for each
+   variable above.
+5. Open the **Actions** tab. If it shows that workflows are disabled in this
+   fork, enable them.
+6. Start one run by hand: **Actions > Agent > Run workflow**, Sheet `test`.
+   When it succeeds, the hourly schedule takes over.
+
+With the GitHub CLI, steps 3 and 4 are `gh secret set NAME` (it asks for the
+value; `gh secret set GOOGLE_SERVICE_ACCOUNT_JSON < service-account.json` for
+the key) and `gh variable set NAME --body VALUE`.
+
+GitHub runs scheduled workflows on a best-effort basis: a run can start a few
+minutes late. In a public repository, GitHub also pauses the schedule after
+60 days without any activity in the repository.

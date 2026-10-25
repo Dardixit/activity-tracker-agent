@@ -4,7 +4,7 @@ Run with:  .venv/bin/python revert.py 67-82 84          (ranges allowed)
            .venv/bin/python revert.py --test 67-82     (reason gets "test: " in front)
 
 - A cell change is undone by writing the old value back.
-- A new Activity Log row (logged with Source '' -> 'agent') is deleted.
+- A new Activity Log row (logged with Source '' -> 'agent' or 'calendar') is deleted.
 - A row moved to keep date order is not moved back as such: restoring its old
   Date puts it back in date order, so the "(whole row)" move rows are skipped.
 Activity Log rows are found by their Entry ("date | activity"), because row
@@ -19,6 +19,9 @@ import agent
 import okr
 import sheet_writer
 from sheet_writer import CHANGES, CHANGES_HEADER, WriteRefused, cell, log_row, update_cells
+
+# Source values of rows the bot added itself (notes and calendar), which a revert deletes.
+ADDED_BY = ("agent", "calendar")
 
 
 def parse_numbers(args):
@@ -94,7 +97,7 @@ def main(args):
         by_column = {log["Column"]: log for _, log in items}
         source = by_column.get(agent.SOURCE)
         changes_rows = f"{items[0][0]}-{items[-1][0]}" if len(items) > 1 else str(items[0][0])
-        if tab == agent.ACTIVITY and source and source["Old value"] == "" and source["New value"] == "agent":
+        if tab == agent.ACTIVITY and source and source["Old value"] == "" and source["New value"] in ADDED_BY:
             deletes.append(row)
             logs.append(log_row(tab, row, entry, "(whole row)", f"row {row}", "deleted",
                                 f"Revert of Changes rows {changes_rows} (row added by the agent)"))

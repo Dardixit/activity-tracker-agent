@@ -1,0 +1,121 @@
+# Runs the bot every hour at minute 7, from 07:07 to 00:07 Helsinki time
+# (none from 01:00 to 06:59), as bot.py --once: handles waiting Telegram
+# messages and button taps, runs the calendar check and the OKR recount, then
+# exits. State between runs lives in the Sheet's hidden Agent state tab.
+#
+# The first step checks that the required secrets and variables are set. If
+# any is missing (as in the public showcase repository, which has none), the
+# run says which ones and stops there, successfully: it never fails on its
+# schedule. See README.md, "Run it on GitHub Actions".
+#
+# Required secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GOOGLE_TEST_SHEET_ID,
+#   GOOGLE_SERVICE_ACCOUNT_JSON (plus GOOGLE_SHEET_ID for the real Sheet).
+# Required variables: ANTHROPIC_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID,
+#   ANTHROPIC_SERVICE_ACCOUNT_ID.
+# Optional: secret GOOGLE_CALENDAR_ID (calendar check on when set); variables
+#   ANTHROPIC_WORKSPACE_ID, SCHEDULE_ENABLED ("false" pauses scheduled runs),
+#   SCHEDULE_SHEET_TARGET ("test" by default, or "real"), REAL_SHEET_APPROVED
+#   ("true" allows the real Sheet), ACTIVITY_TAB, PROJECTS_TAB, CATEGORIES.
+# No ANTHROPIC_API_KEY: it would take precedence over federation.
+
+name: Agent
+
+on:
+  schedule:
+    # 00:07 and 07:07-23:07, Helsinki time with daylight saving time; minute 7
+    # keeps away from the busy top of the hour.
+    - cron: "7 0,7-23 * * *"
+      timezone: "Europe/Helsinki"
+  workflow_dispatch:
+    inputs:
+      sheet:
+        description: Sheet to use
+        type: choice
+        options: [test, real]
+        default: test
+      test_labels:
+        description: 'Put "test: " in front of every Changes reason'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write   # the GitHub OIDC token, exchanged for a Claude API token
+
+# Never two runs at once; a run that arrives meanwhile waits for this one.
+concurrency:
+  group: agent
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: github.event_name == 'workflow_dispatch' || vars.SCHEDULE_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      SHEET_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.sheet || vars.SCHEDULE_SHEET_TARGET || 'test' }}
+      REASON_PREFIX: "${{ inputs.test_labels && 'test: ' || '' }}"
+      STATE_BACKEND: sheet
+      CALENDAR_SYNC: ${{ secrets.GOOGLE_CALENDAR_ID != '' && 'on' || 'off' }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_TEST_SHEET_ID: ${{ secrets.GOOGLE_TEST_SHEET_ID }}
+      GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+      ACTIVITY_TAB: ${{ vars.ACTIVITY_TAB }}
+      PROJECTS_TAB: ${{ vars.PROJECTS_TAB }}
+      CATEGORIES: ${{ vars.CATEGORIES }}
+    steps:
+      - name: Check secrets and variables
+        id: config
+        run: |
+          missing=""
+          for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID GOOGLE_TEST_SHEET_ID GOOGLE_SERVICE_ACCOUNT_JSON \
+                      ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID ANTHROPIC_SERVICE_ACCOUNT_ID; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ "$SHEET_TARGET" = "real" ] && [ -z "$GOOGLE_SHEET_ID" ]; then missing="$missing GOOGLE_SHEET_ID"; fi
+          if [ -n "$missing" ]; then
+            echo "Not configured, nothing to do. Missing:$missing"
+            echo "To run the bot, add these secrets and variables (README.md, \"Run it on GitHub Actions\")."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse the real Sheet until approved
+        if: steps.config.outputs.ok == 'true' && env.SHEET_TARGET == 'real' && vars.REAL_SHEET_APPROVED != 'true'
+        run: |
+          echo "::error::The real Sheet is not approved yet: set the REAL_SHEET_APPROVED variable to true."
+          exit 1
+
+      - uses: actions/checkout@v7
+        if: steps.config.outputs.ok == 'true'
+
+      - uses: actions/setup-python@v6
+        if: steps.config.outputs.ok == 'true'
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      - name: Install
+        if: steps.config.outputs.ok == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Run the agent once
+        if: steps.config.outputs.ok == 'true'
+        run: python bot.py --once --reason-prefix "$REASON_PREFIX"
+
+      - name: Tell Telegram the run failed
+        if: failure() && steps.config.outputs.ok == 'true'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -sS -o /dev/null "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=Agent run failed (${SHEET_TARGET} Sheet). Details: ${RUN_URL}"

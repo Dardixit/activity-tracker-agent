@@ -200,11 +200,14 @@ offset, open questions with their paused agent runs, calendar state) is kept
 in the Sheet's hidden `Agent state` tab. Runs never overlap, each is stopped
 after 6 minutes, and a failed run sends you a Telegram message.
 
-**In this repository the workflow has no secrets.** Each scheduled run first
-checks for them, finds none, prints which ones are missing and exits without
-doing anything; the run still shows as successful. After you fork the
-repository, add your own secrets and variables and set up the trigger, the
-runs work.
+**In this repository the workflow has no secrets, and the GitHub schedule
+is switched off** (`SCHEDULE_ENABLED=false`), so nothing runs on its own. A
+run started by hand first checks for the secrets, finds none, prints which
+ones are missing and exits without doing anything; the run still shows as
+successful. After you fork the repository, add your own secrets and variables
+and set up the trigger, the runs work. In a fork, leave `SCHEDULE_ENABLED`
+unset or set it to `true` to use GitHub's schedule as a backup (see "GitHub's
+schedule as an optional backup").
 
 ### Secrets and variables
 
@@ -222,7 +225,7 @@ runs work.
 | `ANTHROPIC_WORKSPACE_ID` | variable, optional | The workspace (`wrkspc_...`); needed when the rule covers more than one. |
 | `SCHEDULE_SHEET_TARGET` | variable, optional | `test` (default) or `real`: the Sheet scheduled runs and the default manual run use. Only runs on this Sheet use Telegram. |
 | `REAL_SHEET_APPROVED` | variable, optional | `true` allows runs on the real Sheet; until then they are refused. |
-| `SCHEDULE_ENABLED` | variable, optional | `false` pauses GitHub's backup schedule; runs started by the external trigger or by hand still work. |
+| `SCHEDULE_ENABLED` | variable, optional | Unset or `true`: GitHub's schedule runs as a backup. `false` switches it off (as in this repository); runs started by the external trigger or by hand still work. |
 | `ACTIVITY_TAB`, `PROJECTS_TAB`, `CATEGORIES` | variables, optional | Tab names and categories, if yours differ from the defaults. |
 | `OWNER_NAMES` | variable, optional | Your own first and last name, comma-separated; the duplicate check ignores them. |
 

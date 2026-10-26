@@ -5,14 +5,19 @@ check() runs at bot start and then hourly (when CALENDAR_SYNC=on in .env):
 2. Events already linked to a row (its Event ID cell): a moved event updates
    the row's Date; a cancelled one asks whether to set Outcome "Cancelled";
    an event that has ended while its row is still Confirmed asks whether you
-   attended (yes -> Done, no -> Missed).
+   attended (yes -> Done, no -> Missed). A final row (Done or Missed, dated
+   today or earlier) never gets a new date: an event that moved to a later
+   day after it (an invite reused for the next meeting) gets a row of its own.
 3. Unlinked events: declined events and titles marked "no" in the hidden
    Calendar titles tab are skipped. The rest go to the model in batches: it
    links each event to an existing row, adds a new row (Status Confirmed),
-   decides the title, or asks you.
-4. Writes go through sheet_writer.Writer.apply, the same code as Telegram notes,
+   decides the title, or asks you. Before any row is added, every row on the
+   same day (linked or not) is searched for the same person or activity name
+   (agent.twin_rows); if one has it, you are asked instead.
+4. Writes go through sheet_writer.Writer, the same code as Telegram notes,
    so new rows are inserted in date order with dropdowns. Every reason starts
-   with "calendar:".
+   with "calendar:". A change the writer refuses is left out, the rest is
+   written, and you are asked about the one left out.
 5. Each question goes out as its own Telegram message with buttons (bot.py).
    A tap, a free-text reply, or a numbered list of answers you confirm is
    turned into writes by answer(). Skip means "not now": the question comes
@@ -30,7 +35,7 @@ decisions; every cell is still checked against the Sheet first) and send its que
 import json
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from googleapiclient.discovery import build
@@ -74,7 +79,11 @@ def load_state():
     else:
         state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     # snoozed: {question key: date (ISO) before which it is not asked again}
-    return {"ignore_cancel": [], "ignore_event": [], "snoozed": {}, **state}
+    # answered: keys of questions you answered whose change a rule refused:
+    #   never asked again (nothing else would show the answer was given)
+    # retried: keys of refused changes you said to try again; refused once
+    #   more, the event is left out instead of asked about again
+    return {"ignore_cancel": [], "ignore_event": [], "snoozed": {}, "answered": [], "retried": [], **state}
 
 
 def snoozed(state, key):
@@ -125,16 +134,58 @@ def row_event_ids(r):
     return [i.strip() for i in r.get(agent.EVENT_ID, "").split(",") if i.strip()]
 
 
+def is_final(r):
+    """Done or Missed and dated today or earlier: the calendar never changes
+    the row's date."""
+    end = agent.event_end(r["Date"])
+    return r["Status"] in agent.PAST_STATUSES and end is not None and end <= agent.now().date()
+
+
+def row_start(r):
+    """When a one-day row with a time ("26.10.2026, 13.00") starts, in Helsinki time; else None."""
+    span = agent.date_span(r["Date"])
+    m = re.search(r",\s*(\d{1,2})[.:](\d{2})", r["Date"] or "")
+    if not span or not m or span[0] != span[1]:
+        return None
+    return datetime.combine(span[0], time(int(m.group(1)), int(m.group(2))), agent.TIMEZONE)
+
+
 def linked_rows(data):
-    """{event id: Sheet row} for rows with an Event ID."""
+    """{event id: Sheet row} for rows with an Event ID. An event that moved on
+    from a final row is in that row and in the row added for its new date;
+    the one it is linked to is the row that is not final (if all are, the
+    latest)."""
     tab = data[agent.ACTIVITY]
     if agent.EVENT_ID not in tab["header"]:
         return {}
-    out = {}
+    out, rank = {}, {}
     for n, values in enumerate(tab["rows"], start=2):
-        for eid in row_event_ids(agent.row_as_dict(tab["header"], values)):
-            out[eid] = n
+        r = agent.row_as_dict(tab["header"], values)
+        this = (not is_final(r), agent.date_key(r["Date"]) or (0, 0, 0), n)
+        for eid in row_event_ids(r):
+            if eid not in out or this > rank[eid]:
+                out[eid], rank[eid] = n, this
     return out
+
+
+def duplicate_question(data, e, fields, exclude=()):
+    """A question instead of adding `fields` for event e, if a row on the same
+    day names the same person or has the same activity name; else None.
+    Rows that already hold e's id are not counted."""
+    twins = [(row, why) for row, why in agent.twin_rows(data, fields)
+             if row not in exclude and e["id"] not in row_event_ids(row_dict(data, row))]
+    if not twins:
+        return None
+    row, why = twins[0]
+    return {"kind": "duplicate", "event_id": e["id"], "title": e["title"], "date": cs.date_text(e), "row": row,
+            "entry": sheet_writer.entry_for(agent.ACTIVITY, row_dict(data, row)), "why": why, "fields": fields}
+
+
+def next_meeting_fields(r, e):
+    """A row for the later date of an event whose row is final: the same
+    Category and Activity, Status Confirmed."""
+    return {"Date": cs.date_text(e), "Status": "Confirmed", "Category": r["Category"],
+            "Activity": r["Activity"], "Description": "-", "Outcome": "-"}
 
 
 def covers(r, event):
@@ -187,12 +238,20 @@ def question_text(item, hints=True):
         text = (f'Calendar event "{item["title"]}" on {item["date"]} starts at the same time as row '
                 f'"{item["entry"]}", which is already linked to the event "{item["other_title"]}". Is it the same event?')
         hint = "(yes = same event, link it to that row / no = different event, add a row / skip = ask again in a week)"
+    elif item["kind"] == "duplicate":
+        text = (f'Calendar event "{item["title"]}" on {item["date"]} looks like row "{item["entry"]}", which is on '
+                f'the same day ({item["why"]}). Is it the same?')
+        hint = "(yes = same, link to that row / no = different, add a row / skip = ask again in a week)"
     elif item["kind"] == "attend":
         text, hint = f'Did you attend "{item["activity"]}" ({item["date"]})?', "(yes = Done / no = Missed)"
     elif item["kind"] == "cancel":
         text = (f'"{item["title"]}" on {item["date"]} was cancelled in the calendar. '
                 f'Set Outcome to "Cancelled" on row "{item["entry"]}"?')
         hint = "(yes/no)"
+    elif item["kind"] == "refused":
+        text = (f'I left out this calendar change ({item["title"]}): {item["change"]}. A rule refused it: '
+                f'{item["problem"]} The rest was written. What should I do?')
+        hint = "(yes = try again at the next check / no = leave this event out / skip = ask again in a week)"
     else:
         raise ValueError(item["kind"])
     return f"{text} {hint}" if hints else text
@@ -201,7 +260,9 @@ def question_text(item, hints=True):
 # Button labels per answer. Skip is always "not now".
 BUTTONS = {"match": [("Same row", "yes"), ("New row", "no"), ("Skip", "skip")],
            "same_time": [("Same event, link to existing row", "yes"), ("Different event, add row", "no"),
-                         ("Skip", "skip")]}
+                         ("Skip", "skip")],
+           "refused": [("Try again next check", "yes"), ("Leave this event out", "no"), ("Skip", "skip")],
+           "duplicate": [("Same, link to existing row", "yes"), ("Different, add row", "no"), ("Skip", "skip")]}
 DEFAULT_BUTTONS = [("Yes", "yes"), ("No", "no"), ("Skip", "skip")]
 
 
@@ -238,8 +299,8 @@ def numbered_answers(text):
 
 
 def item_key(item):
-    if item["kind"] == "title":
-        return f"title:{title_key(item['title'])}"
+    if item["kind"] == "title" or (item["kind"] == "refused" and not item.get("event_id")):
+        return f"{item['kind']}:{title_key(item['title'])}"
     return f"{item['kind']}:{item['event_id']}"
 
 
@@ -420,6 +481,14 @@ class Batch:
                 self.open.discard(eid)
                 return (f"Not added: row {row} \"{r['Activity']}\" is already linked to the event "
                         f"{other['title']!r}, which starts at the same time. The user will be asked."), False
+            # A row on the same day about the same person or activity, linked
+            # or not: never added without asking.
+            question = duplicate_question(self.data, e, fields)
+            if question:
+                self.plan["questions"].append(question)
+                self.open.discard(eid)
+                return (f"Not added: row {question['row']} \"{question['entry']}\" is on the same day "
+                        f"({question['why']}). The user will be asked."), False
             # A same-day row sharing a title word looks like a duplicate: make
             # the model look again once before adding.
             similar = [c for c in candidates(self.data, e, self.taken) if c["same_day"] and any(
@@ -478,8 +547,9 @@ class Batch:
 # ---------------------------------------------------------------- The check
 
 def new_plan():
+    # "continued": ids of events added again for a later date after their row was final.
     return {"links": [], "adds": [], "moves": [], "titles": [], "questions": [], "skipped": [],
-            "undecided": [], "notes": []}
+            "undecided": [], "notes": [], "continued": []}
 
 
 def check(client, practice=False, open_keys=(), events=None, data=None, title_rows=None, get_event=None):
@@ -504,6 +574,19 @@ def check(client, practice=False, open_keys=(), events=None, data=None, title_ro
         e = by_id.get(eid)
         if e and not e["all_day"] and e["start"]:
             starts.setdefault(e["start"], []).append((row, e))
+    # A final row whose event moved on still holds its own start time, so
+    # another event at that moment is asked about, not added twice.
+    for row in range(2, len(data[agent.ACTIVITY]["rows"]) + 2):
+        r = row_dict(data, row)
+        start = row_start(r)
+        if start and is_final(r) and row_event_ids(r) and not any(
+                by_id.get(i, {}).get("start") == start for i in row_event_ids(r)):
+            starts.setdefault(start, []).append((row, {"id": f"row {row}", "title": r["Activity"], "start": start}))
+
+    def held(eid):
+        """You said to leave the event out, or a refused change or duplicate question about it is still open."""
+        return eid in state["ignore_event"] or any(
+            f"{kind}:{eid}" in open_keys or snoozed(state, f"{kind}:{eid}") for kind in ("refused", "duplicate"))
 
     # 1. Events already linked to a row.
     ended_by_row = {}
@@ -521,8 +604,25 @@ def check(client, practice=False, open_keys=(), events=None, data=None, title_ro
                 plan["questions"].append({"kind": "cancel", "event_id": eid, "title": e["title"] or r["Activity"],
                                           "date": r["Date"], "entry": entry, "row": row})
             continue
-        if e and not agent.is_locked(data, row) and cs.moved(e, r["Date"]):
-            plan["moves"].append((e, row, r["Date"], cs.date_text(e)))
+        if e and cs.moved(e, r["Date"]) and not held(eid):
+            if is_final(r):
+                # A final row keeps its date. An event now on a later day is
+                # the next meeting: it gets its own row, linked to it.
+                if e["start"].date() > agent.event_end(r["Date"]):
+                    fields = next_meeting_fields(r, e)
+                    question = duplicate_question(data, e, fields)
+                    if question:
+                        plan["questions"].append(question)
+                    else:
+                        plan["adds"].append((e, fields, f'the event moved from {r["Date"]} to {cs.date_text(e)}, '
+                                                        f'but row "{entry}" is {r["Status"]}, so it stays as it is'))
+                        plan["continued"].append(eid)
+                else:
+                    plan["notes"].append(f'Row "{entry}" is {r["Status"]}: its date stays, although the event '
+                                         f'"{e["title"]}" now shows {cs.date_text(e)}.')
+                continue
+            if not agent.is_locked(data, row):
+                plan["moves"].append((e, row, r["Date"], cs.date_text(e)))
         ended = (e is not None and cs.has_ended(e)) or (key is not None and type(today)(*key) < today)
         ended_by_row.setdefault(row, []).append((eid, ended))
     # One attendance question per row, once all its events have ended.
@@ -544,6 +644,8 @@ def check(client, practice=False, open_keys=(), events=None, data=None, title_ro
             why = "declined by you"
         elif e["id"] in state["ignore_event"]:
             why = "you said to leave it out"
+        elif held(e["id"]):
+            why = "a refused change or duplicate question about it is still open"
         elif titles.get(title_key(e["title"]), {}).get("Track") == "no":
             why = f"title marked no ({titles[title_key(e['title'])]['Decided by']})"
         elif f"title:{title_key(e['title'])}" in open_keys:
@@ -595,6 +697,8 @@ def check(client, practice=False, open_keys=(), events=None, data=None, title_ro
                 series_rows.setdefault(key, []).append(row)
     first_add = {}
     for e, fields, _ in sorted(plan["adds"], key=lambda a: a[0]["start"]):
+        if e["id"] in plan["continued"]:
+            continue  # already copies its own earlier row
         keys = [k for k in (e["recurring_id"], title_key(e["title"])) if k]
         rows = next((series_rows[k] for k in keys if k in series_rows), [])
         template = {}
@@ -619,7 +723,8 @@ def check(client, practice=False, open_keys=(), events=None, data=None, title_ro
 
     # Questions already waiting for an answer are not asked again; at most
     # MAX_QUESTIONS go out now, the rest at a later check.
-    fresh = [q for q in plan["questions"] if item_key(q) not in open_keys and not snoozed(state, item_key(q))]
+    fresh = [q for q in plan["questions"] if item_key(q) not in open_keys and not snoozed(state, item_key(q))
+             and item_key(q) not in state["answered"]]
     plan["questions"], plan["later"] = fresh[:MAX_QUESTIONS], fresh[MAX_QUESTIONS:]
     plan["data"], plan["titles_rows"] = data, title_rows or []
     return plan
@@ -646,7 +751,7 @@ def title_edits(title_rows, decisions, today_text):
             if action == "update" and old == value:
                 continue
             edits.append({"tab": TITLES_TAB, "row": row, "col": header.index(column), "column": column,
-                          "old": old, "new": value, "action": action, "entry": d["title"],
+                          "old": old, "new": value, "action": action, "entry": d["title"], "title": d["title"],
                           "reason": f"calendar: title decided by {d['by']}: {d['reason']}"})
     return edits
 
@@ -668,23 +773,66 @@ def writes(plan):
     for row, links in by_row.items():
         ids = row_event_ids(row_dict(data, row)) + [e["id"] for e, _ in links]
         what = "; ".join(f'"{e["title"]}" ({cs.date_text(e)}): {reason}' for e, reason in links)
-        edits.append(cell_edit(data, row, agent.EVENT_ID, ",".join(ids), f"calendar: matched to event {what}"))
+        edits.append({**cell_edit(data, row, agent.EVENT_ID, ",".join(ids), f"calendar: matched to event {what}"),
+                      "event_id": links[0][0]["id"], "title": links[0][0]["title"]})
     for e, row, old, new in plan["moves"]:
-        edits.append(cell_edit(data, row, "Date", new, f'calendar: event "{e["title"]}" moved from {old} to {new}'))
+        edits.append({**cell_edit(data, row, "Date", new, f'calendar: event "{e["title"]}" moved from {old} to {new}'),
+                      "event_id": e["id"], "title": e["title"]})
     for e, fields, reason in plan["adds"]:
         values = {**fields, agent.SOURCE: SOURCE_VALUE, agent.LOCKED: False, agent.EVENT_ID: e["id"]}
-        inserts.append({"tab": agent.ACTIVITY, "values": values,
+        inserts.append({"tab": agent.ACTIVITY, "values": values, "event_id": e["id"], "title": e["title"],
                         "reason": f'calendar: event "{e["title"]}" ({fields["Date"]}): {reason}'})
     edits += title_edits(plan["titles_rows"], plan["titles"], agent.now().strftime("%d.%m.%Y"))
     return edits, inserts
 
 
+def refused_question(items, why):
+    """The question about changes the writer refused and left out."""
+    first = items[0]
+    if "values" in first:  # a new row
+        change = f'add the row {first["values"]["Date"]} "{first["values"]["Activity"]}"'
+    else:
+        change = "; ".join(f'{e["entry"]}: {e["column"]} {sheet_writer.shown(e["old"]) or "(empty)"} -> '
+                           f'{sheet_writer.shown(e["new"])}' for e in items)
+    return {"kind": "refused", "event_id": first.get("event_id"), "title": first.get("title", ""),
+            "change": change, "problem": why}
+
+
+def without(changes, refused):
+    return [c for c in changes if not any(c is i for items, _ in refused for i in items)]
+
+
 def apply(writer, plan):
-    """Write the plan. Returns a short summary for Telegram, or None if nothing changed."""
+    """Write the plan. A change the writer refuses is left out, logged, and
+    added to plan["questions"]; the rest is written. Returns a short summary
+    for Telegram, or None if nothing changed."""
     edits, inserts = writes(plan)
     if not edits and not inserts:
         return None
-    logged = writer.apply(edits, inserts)
+    logged, refused = writer.apply_allowed(edits, inserts)
+    asked = {item_key(q) for q in plan["questions"]}
+    state, dropped = load_state(), []
+    for items, why in refused:
+        print(f"Calendar change left out: {why}")
+        question = refused_question(items, why)
+        key = item_key(question)
+        if key in state["retried"]:
+            # You said to try again and it was refused again: left out for
+            # good, so the question is never sent a second time.
+            state["retried"].remove(key)
+            state["answered"].append(key)
+            if question["event_id"]:
+                state["ignore_event"].append(question["event_id"])
+            dropped.append(f"  {question['change']}: {why}")
+        elif key not in asked:
+            asked.add(key)
+            plan["questions"].append(question)
+    if dropped:
+        save_state(state)
+    edits, inserts = without(edits, refused), without(inserts, refused)
+    if not edits and not inserts:
+        return ("Calendar check.\n\nRefused again after you said to try again, so the event is left out:\n"
+                + "\n".join(dropped)) if dropped else None
     parts = []
     if inserts:
         parts.append("Added from the calendar:\n" + "\n".join(
@@ -696,6 +844,8 @@ def apply(writer, plan):
     if moves:
         parts.append("Moved in the calendar:\n" + "\n".join(f"  {e['entry']}: {e['old']} -> {e['new']}" for e in moves))
     parts.append(sheet_writer.logged_text(logged))
+    if dropped:
+        parts.append("Refused again after you said to try again, so the event is left out:\n" + "\n".join(dropped))
     return "Calendar check.\n\n" + "\n\n".join(parts)
 
 
@@ -746,6 +896,7 @@ def answer(client, writer, items, text, answers=None, numbers=None):
         a = answers.get(n)
         if a is None:
             continue
+        before = len(edits), len(inserts)
         kind = item["kind"]
         if a == "skip":
             # Not now: no change, asked again after SNOOZE_DAYS.
@@ -769,7 +920,13 @@ def answer(client, writer, items, text, answers=None, numbers=None):
                 edits.append(cell_edit(data, row, "Outcome", new, "calendar: event cancelled, you answered yes"))
             else:
                 state["ignore_cancel"].append(item["event_id"])
-        elif kind in ("match", "same_time") and a in ("yes", "no"):
+        elif kind == "refused" and a in ("yes", "no"):
+            # yes: nothing to write now, the next check tries again (once).
+            if a == "yes":
+                state["retried"].append(item_key(item))
+            elif item.get("event_id"):
+                state["ignore_event"].append(item["event_id"])
+        elif kind in ("match", "same_time", "duplicate") and a in ("yes", "no"):
             if a == "yes":
                 row = next((n2 for n2, v in enumerate(data[agent.ACTIVITY]["rows"], 2)
                             if sheet_writer.entry_for(agent.ACTIVITY, row_dict(data, n2)) == item["entry"]), None)
@@ -792,10 +949,18 @@ def answer(client, writer, items, text, answers=None, numbers=None):
         else:
             notes.append(f"{n}: \"{a}\" is not a possible answer here.")
             continue
+        for change in edits[before[0]:] + inserts[before[1]:]:
+            change["question"] = item_key(item)  # to remember the answer if a rule refuses the change
         done.append(n)
 
-    edits += title_edits(title_rows, decisions, agent.now().strftime("%d.%m.%Y"))
-    logged = writer.apply(edits, inserts) if (edits or inserts) else None
+    for e in title_edits(title_rows, decisions, agent.now().strftime("%d.%m.%Y")):
+        edits.append({**e, "question": f"title:{title_key(e['title'])}"})
+    logged, refused = writer.apply_allowed(edits, inserts) if (edits or inserts) else (None, [])
+    edits, inserts = without(edits, refused), without(inserts, refused)
+    notes += [f"Left out, a rule refused it: {why}. Your answer is kept, so I won't ask again." for _, why in refused]
+    # The answer stays recorded even though its change could not be written.
+    state["answered"] += sorted({i["question"] for items, _ in refused for i in items if i.get("question")}
+                                - set(state["answered"]))
     save_state(state)
 
     remaining = [item for n, item in zip(numbers, items) if n not in done]
@@ -833,6 +998,7 @@ def save_plan(plan):
         "made": agent.now().isoformat(),
         "links": [{"event": _event_json(e), "entry": entry(row), "reason": r} for e, row, r in plan["links"]],
         "adds": [{"event": _event_json(e), "fields": f, "reason": r} for e, f, r in plan["adds"]],
+        "continued": plan["continued"],
         "moves": [{"event": _event_json(e), "entry": entry(row), "old": o, "new": n} for e, row, o, n in plan["moves"]],
         "titles": plan["titles"],
         "questions": plan["questions"],
@@ -872,10 +1038,14 @@ def load_saved_plan(open_keys=()):
             plan["moves"].append((e, row, item["old"], item["new"]))
     for item in saved["adds"]:
         e = _event_back(item["event"])
-        if e["id"] in linked:
+        again = (e["id"] in saved.get("continued", []) and e["id"] in linked
+                 and is_final(row_dict(data, linked[e["id"]])))
+        if e["id"] in linked and not again:
             notes.append(f"{e['title']!r} is already in the Sheet: not added again.")
         else:
             plan["adds"].append((e, item["fields"], item["reason"]))
+            if again:
+                plan["continued"].append(e["id"])
     plan["titles"] = saved["titles"]
     plan["questions"] = [q for q in saved["questions"] if item_key(q) not in set(open_keys)]
     plan["data"], plan["titles_rows"] = data, title_rows

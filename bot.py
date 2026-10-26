@@ -4,7 +4,9 @@ to the Sheet (logged in the Changes tab) and replies with what it changed.
 If the note conflicts with the Sheet, the bot asks instead and writes nothing.
 Answer a question by replying to it in Telegram (reply /skip to drop it). Before
 a new row names a person whose first name is already in the Sheet, the bot asks
-whether it is the same person, with buttons. Any
+whether it is the same person, with buttons; before it adds a row on the same
+day as a calendar row about the same person or activity, it asks whether it is
+the same thing, with buttons. Any
 message that is not a reply to an open question is a new note, except a
 numbered list of answers while calendar questions are open: the bot asks
 whether it answers them.
@@ -28,9 +30,18 @@ Run with:  .venv/bin/python bot.py          (keeps polling; Ctrl+C to stop)
 Options:   --reason-prefix "test: "         (put in front of every Changes reason)
            --force                          (poll even if the Agent state tab says
                                              GitHub Actions runs the bot)
+           --scheduled                      (with --once, for the backup schedule:
+                                             do nothing from 01:00 to 06:59 Helsinki
+                                             time or if a run already finished this hour)
 
 Where the Telegram offset, open questions and calendar state live is set by
 STATE_BACKEND (state.py): local files by default, the Agent state tab with "sheet".
+
+There is one bot and one chat, but each Sheet keeps its own open questions.
+So only runs on the Sheet named by TELEGRAM_SHEET_TARGET (default "real") use
+Telegram. A run on the other Sheet never fetches updates (fetching them would
+take your taps and replies away from the runs that know their questions) and
+prints what it would have sent instead of sending it.
 """
 
 import json
@@ -84,16 +95,26 @@ OFFSET_FILE = Path(__file__).with_name("last_update_id.txt")
 # button tap can answer it. (Ignored by git: *.json.)
 #   {"kind": "note", "pending": <paused agent run>}
 #     plus "person" (first name) and "text" (message text) for a same-name
-#     question, which has the agent.PERSON_CHOICES buttons
+#     question, which has the agent.PERSON_CHOICES buttons, or "duplicate" (row)
+#     and "text" for a same-day duplicate question (agent.DUPLICATE_CHOICES)
 #   {"kind": "calendar", "items": [item], "group": id, "number": n, "of": total, "text": message text}
 #   {"kind": "confirm", "text": your numbered list, "group": id, "question": message text}
 # Calendar questions sent together share a group; "number" is their n of total.
 PENDING_FILE = Path(__file__).with_name("pending_questions.json")
 
+# The Sheet whose runs own the Telegram chat (see the docstring above).
+TELEGRAM_SHEET_TARGET = os.getenv("TELEGRAM_SHEET_TARGET", "").strip().lower() or "real"
+telegram_on = False  # set by main(): whether this run uses Telegram
+
 # The calendar check runs at start and then this often.
 CALENDAR_EVERY = 3600
 CALENDAR_SYNC = os.getenv("CALENDAR_SYNC", "").strip().lower() == "on"
 calendar_active = False  # set by main(): whether this bot runs calendar checks
+# --scheduled runs do nothing in these Helsinki hours (01:00-06:59) ...
+QUIET_HOURS = range(1, 7)
+# ... or in an hour in which a one-shot run already finished (Agent state key).
+LAST_RUN_KEY = "last_run"
+
 # What went wrong in this run (handled errors included), so --once can exit
 # with status 1 and GitHub Actions reports the run as failed.
 run_errors = []
@@ -214,9 +235,13 @@ def send(chat_id, text, question=None, buttons=None):
     is stored as an open question under the sent message's id, so a reply or a
     button tap answers it. A same-name question gets its buttons here.
     Returns the message id (None if sending failed)."""
-    if buttons is None and question and question.get("person"):
-        buttons = [(label, value) for value, label, _ in agent.PERSON_CHOICES]
+    if buttons is None and question:
+        buttons = [(label, value) for value, label, _ in agent.question_choices(question)] or None
     text = plain(text)
+    if not telegram_on:
+        # Not stored as a question either: no message could ever answer it.
+        print(f"\n[Telegram is off for the {agent.sheets.SHEET_TARGET} Sheet; not sent]\n{text}")
+        return None
     if len(text) > TELEGRAM_MAX_LEN:
         text = text[: TELEGRAM_MAX_LEN - 20] + "\n\n[...cut off]"
     data = {"chat_id": chat_id, "text": text}
@@ -286,9 +311,10 @@ def finish(writer, data, run):
     Returns (reply text, question to store or None)."""
     if run["asked"]:
         text = "Question before I change anything (nothing was written):\n\n" + run["question"]
-        if run["person"]:
+        if run["person"] or run["duplicate"]:
             text += "\n\nTap a button, or reply to this message in words, or reply /skip to drop the question."
-            return text, {"kind": "note", "pending": run["pending"], "person": run["person"], "text": text}
+            return text, {"kind": "note", "pending": run["pending"], "person": run["person"],
+                          "duplicate": run["duplicate"], "text": text}
         text += "\n\nReply to this message with your answer, or reply /skip to drop the question."
         return text, {"kind": "note", "pending": run["pending"]}
     if run["problem"]:
@@ -383,7 +409,16 @@ def handle_tap(client, writer, callback):
     value = callback.get("data", "")
     question = load_questions().get(question_id)
     if question is None:
-        acknowledge(callback["id"], "This question is already answered.")
+        # Answered already, or never stored here. Say so and take the buttons
+        # away, so the tap is never lost without a word.
+        shown = message.get("text", "")
+        print(f"\nButton {value!r} on message {question_id}: no open question with that id. "
+              f"Message: {shown[:200]!r}")
+        acknowledge(callback["id"], "This question is not open any more.")
+        if shown:
+            edit(chat_id, int(question_id), f"{shown}\n\n(Closed: this question is not open any more.)")
+        send(chat_id, "That button belongs to a question that is not open any more, so nothing was changed. "
+                      "If it still matters, send it to me as a message.")
         return
     print(f"\nButton {value!r} on question {question_id}")
     acknowledge(callback["id"])
@@ -404,8 +439,8 @@ def handle_tap(client, writer, callback):
                 send(chat_id, reply, question=new_question)
             return
         if question["kind"] == "note":
-            label = {v: label for v, label, _ in agent.PERSON_CHOICES}.get(value)
-            if label is None or not question.get("person"):
+            label = {v: label for v, label, _ in agent.question_choices(question)}.get(value)
+            if label is None:
                 return
             edit(chat_id, int(question_id), f"{question['text']}\n\nYour answer: {label}")
             show_typing(chat_id)
@@ -544,7 +579,7 @@ def run_once(client, writer, calendar):
     """Handle every waiting update, run the calendar check and the OKR
     recount, then return. Returns the number of updates handled."""
     offset, handled = load_offset(), 0
-    for _ in range(ONCE_MAX_BATCHES):
+    for _ in range(ONCE_MAX_BATCHES if telegram_on else 0):
         # timeout=0: answer at once, also when nothing is waiting.
         response = retry.call("Telegram getUpdates", lambda: requests.get(
             f"{API}/getUpdates", params={"offset": offset, "timeout": 0}, timeout=30).json())
@@ -564,7 +599,31 @@ def run_once(client, writer, calendar):
     return handled
 
 
-def main(reason_prefix="", calendar=None, once=False, force=False):
+def scheduled_skip():
+    """Why a --scheduled run should do nothing now, or None.
+
+    The external hourly trigger is the main one; GitHub's schedule is a backup
+    that comes at uncertain times, so it runs only when the hour has had no
+    run yet. A second run in the same hour would do no harm either (questions
+    already open are not sent again), it is just not needed."""
+    now = agent.now()
+    if now.hour in QUIET_HOURS:
+        return f"{now:%H:%M} Helsinki time is in the quiet hours (01:00-06:59)."
+    last = state.store().get(LAST_RUN_KEY, {}) if state.in_sheet() else {}
+    if last.get("hour") == now.strftime("%Y-%m-%d %H"):
+        return f"a run already finished this hour ({last.get('at')}, {last.get('trigger')})."
+    return None
+
+
+def record_run():
+    """Note that a one-shot run finished this hour (see scheduled_skip)."""
+    if state.in_sheet():
+        now = agent.now()
+        state.store().put({LAST_RUN_KEY: {"hour": now.strftime("%Y-%m-%d %H"), "at": now.strftime("%H:%M"),
+                                          "trigger": os.getenv("GITHUB_EVENT_NAME") or "by hand"}})
+
+
+def main(reason_prefix="", calendar=None, once=False, force=False, scheduled=False):
     """Poll Telegram and handle messages until Ctrl+C, or with once=True
     handle what is waiting and return (see run_once).
 
@@ -573,12 +632,25 @@ def main(reason_prefix="", calendar=None, once=False, force=False):
     calendar overrides CALENDAR_SYNC (tests turn it off or on).
     force=True polls even if the Agent state tab says GitHub Actions runs the
     bot (two pollers would take each other's messages).
+    scheduled=True (with once) does nothing when scheduled_skip says so.
     """
-    global calendar_active
+    global calendar_active, telegram_on
     calendar = calendar_active = CALENDAR_SYNC if calendar is None else calendar
-    if not once and not force and state.runner_in_sheet() == "github-actions":
+    telegram_on = agent.sheets.SHEET_TARGET == TELEGRAM_SHEET_TARGET
+    if not telegram_on and not once:
+        sys.exit(f"Telegram belongs to the {TELEGRAM_SHEET_TARGET} Sheet's runs (TELEGRAM_SHEET_TARGET), "
+                 f"so the bot can't poll for the {agent.sheets.SHEET_TARGET} Sheet.")
+    # A second poller, or a one-shot run with local state files, would take
+    # Actions' messages without knowing its questions.
+    if telegram_on and not force and (not once or not state.in_sheet()) \
+            and state.runner_in_sheet() == "github-actions":
         sys.exit("GitHub Actions runs this bot now (Agent state tab, key \"runner\").\n"
-                 "Polling here as well would take its messages. Use --force only if Actions is switched off.")
+                 "Running here would take its messages. Use --force only if Actions is switched off.")
+    if once and scheduled:
+        why = scheduled_skip()
+        if why:
+            print(f"Scheduled run skipped: {why}")
+            return 0
     # Confirm the token works and show which bot we are connected to.
     # Tried until Telegram answers: a network error at start must not stop the bot.
     me = retry.call("Telegram getMe", lambda: requests.get(f"{API}/getMe", timeout=30).json(), attempts=10**9)
@@ -589,13 +661,17 @@ def main(reason_prefix="", calendar=None, once=False, force=False):
     print(f"Code version: {code_version()}")
     print(f"Calendar check: {'on' if calendar else 'off (set CALENDAR_SYNC=on to turn it on)'}")
     print(f"State: {'Agent state tab' if state.in_sheet() else 'local files'}")
+    print(f"Telegram: {'on' if telegram_on else f'off (it belongs to the {TELEGRAM_SHEET_TARGET} Sheet: no updates fetched, nothing sent)'}")
 
     client = agent.make_client()
     writer = sheet_writer.Writer()
     writer.reason_prefix = reason_prefix
-    migrate_batches(ALLOWED_CHAT_ID)
+    if telegram_on:
+        migrate_batches(ALLOWED_CHAT_ID)
     if once:
         handled = run_once(client, writer, calendar)
+        if not run_errors:
+            record_run()
         print(f"\nOne-shot run done: {handled} update(s) handled, {len(run_errors)} problem(s).")
         for problem in run_errors:
             print(f"  {problem}")
@@ -652,6 +728,7 @@ def option(args, name):
 if __name__ == "__main__":
     args = sys.argv[1:]
     try:
-        sys.exit(main(reason_prefix=option(args, "--reason-prefix"), once="--once" in args, force="--force" in args))
+        sys.exit(main(reason_prefix=option(args, "--reason-prefix"), once="--once" in args, force="--force" in args,
+                      scheduled="--scheduled" in args))
     except KeyboardInterrupt:
         print("\nStopped.")

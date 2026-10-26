@@ -18,7 +18,7 @@ install packages with `uv pip install --python .venv/bin/python <package>`.
 | `bot.py` | The bot: runs the agent on Telegram notes, writes, replies, sends questions (one per message, with buttons), runs the calendar check. `--once` (GitHub Actions): handle what is waiting, calendar check, OKR recount, exit (status 1 if anything went wrong). Without it: polls, checks the calendar hourly, restarts itself when a `.py` file changes, and refuses to start while the Agent state tab says GitHub Actions runs the bot. |
 | `state.py` | Where the Telegram offset, open questions (with paused runs) and calendar state live: local files, or the hidden Agent state tab with `STATE_BACKEND=sheet`. |
 | `migrate_state.py` | One-time move of the local state files into the Agent state tab; sets runner = github-actions. |
-| `.github/workflows/agent.yml` | GitHub Actions: checks its secrets and variables (exits quietly if any is missing), then `bot.py --once` at minute 7 of 00 and 07-23 Helsinki time; manual Run workflow button (test or real Sheet). |
+| `.github/workflows/agent.yml` | GitHub Actions: checks its secrets and variables (exits quietly if any is missing), then `bot.py --once`. Started every 30 minutes by an external cron service (workflow_dispatch), with GitHub's own schedule as an optional backup (`--scheduled`); manual Run workflow button (the scheduled Sheet by default, or test/real). |
 | `agent.py` | The agent: prompt, tools (`search_rows`, `propose_change`, `ask_user`), the rule checks (`check_change`), pausing and continuing runs for questions, Helsinki clock (`now()`). Never writes itself. |
 | `sheet_writer.py` | All writes. One atomic `batchUpdate` per write: cell changes + their `Changes` rows. Re-reads every cell first; inserts Activity Log rows in date order; moves rows whose Date changes. |
 | `calendar_source.py` | Reads the shared Google Calendar (read-only), today to 2 months ahead, one item per occurrence. |
@@ -28,6 +28,9 @@ install packages with `uv pip install --python .venv/bin/python <package>`.
 | `sheets.py` | Settings (Sheet selection, tab names, categories) and Google credentials. |
 | `setup_sheet.py` | One-time Sheet setup (Locked, Source, Event ID columns; Changes tab; hidden Calendar titles and Agent state tabs). Safe to run again. |
 | `test_bot.py` | Runs `bot.main()` with Telegram faked; test writes are labelled. |
+| `test_continue.py` | Saves a question, changes the system prompt and tools, and continues it (calls Claude; writes nothing). |
+| `test_answers.py` | Offline: every calendar question kind and answer; the next check never asks it again (Skip: after 7 days); refused writes and "Try again" included. |
+| `test_runs.py` | Three `bot.py --once` runs on the test Sheet, each its own process with the Agent state tab, Telegram faked: question asked, tap applied and question closed, nothing asked again; a run on the other Sheet leaves the taps alone. |
 | `revert.py` | Undoes Changes rows. |
 | `repair_rows.py` | Puts agent rows that are out of date order or lack dropdowns back in place. |
 | `dry_run.py` | Runs the agent on a note and prints the proposal; never writes. |
@@ -86,10 +89,41 @@ Most are enforced in code, not only in the prompt. Where both exist, keep both.
   event is left out) / "Different event, add row" / "Skip" (asked again after
   a week). `calendar_sync.Batch.same_start`, checked when the model calls
   `add_row`.
+- **Same day, same person or activity: ask before adding.** Before the
+  calendar adds a row (a model `add_row`, or the new row for a final row's
+  moved event), every Activity Log row on that date, linked or not, is
+  searched for the same person/company name or the same activity name
+  (`agent.twin_rows`). If one matches, the bot asks with the buttons "Same,
+  link to existing row" (the event's ID is added to that row) / "Different,
+  add row" / "Skip" (asked again after a week). A note that adds a row
+  matching a calendar row on the same day is rejected until the agent called
+  `ask_user` with `duplicate_row`; same buttons. `calendar_sync.duplicate_question`,
+  `agent.duplicate_problem`. Your own names (`OWNER_NAMES` in `.env`, `agent.OWN_NAMES`)
+  never count, since calendar titles often carry them.
 - **Done/Missed only for past dates.** Status Done or Missed is allowed only
   when the row's date (last day of a range) is today or earlier, Helsinki
   time; otherwise the agent must ask. `agent.past_status_problem`, checked in
   the agent and in the writer.
+- **Done/Missed rows are final.** A row dated today or earlier with Status
+  Done or Missed never gets a new date from the calendar. If its linked
+  event now shows a later date (an invite reused for the next meeting), a
+  new row is added for that date: Status Confirmed, same Category and
+  Activity, the same Event ID; the final row stays as it is and the event
+  counts as linked to the new row. Each occurrence of a recurring event has
+  its own row. `calendar_sync.is_final`, checked in `check`.
+- **One refused change never stops a calendar check.** `Writer.apply_allowed`
+  leaves out what the checks refuse and writes the rest; the bot logs it and
+  asks on Telegram ("Try again next check" / "Leave this event out" / "Skip").
+  Refused again after "Try again", the event is left out and the check
+  summary says so; the question is not sent again. Note runs stay
+  all-or-nothing.
+- **A question answered once is never sent again.** Each answer leaves a
+  trace the next check sees: the row's Status/Outcome/Event ID, a new linked
+  row, a Calendar titles row, or `calendar_state` (`ignore_cancel`,
+  `ignore_event`, `snoozed`). When a rule refuses the change an answer asks
+  for (e.g. a locked row), its key goes in `calendar_state.answered`. The one
+  planned exception: Skip asks again after 7 days. `test_answers.py` checks
+  every kind and answer.
 - **Never delete rows.** Cancelled calendar events keep their row: Outcome
   becomes "Cancelled", Status is left as it is. The only code that deletes
   rows is `revert.py` / `repair_rows.py`, for undoing or re-placing rows the
@@ -109,6 +143,27 @@ Most are enforced in code, not only in the prompt. Where both exist, keep both.
 - **Every write is logged in `Changes` in the same atomic request.** Calendar
   writes have reasons starting with `calendar:`. The one exception: writes to
   the Agent state tab, which is bookkeeping, not tracker data.
+- **Open questions survive code changes.** A paused run is saved with
+  Claude's thinking blocks, which only fit the system prompt and tools they
+  were made with. `agent.create_message` sends
+  `thinking.block_binding.prefix_mismatch_behavior = "drop_block"` (beta
+  `thinking-binding-controls-2026-08-01`), so such blocks are dropped; if the
+  API still refuses one, the thinking blocks are removed and the call is made
+  again. After changing the prompt or tools, run `test_continue.py`.
+- **Telegram belongs to one Sheet.** There is one bot and one chat, but each
+  Sheet's Agent state tab has its own Telegram offset and open questions.
+  Fetching updates confirms them to Telegram, which then deletes them, so a run
+  on the wrong Sheet would take your taps and replies away for good and send
+  its own copies of the questions. Only runs on `TELEGRAM_SHEET_TARGET`
+  (default `real`; the workflow sets it to the schedule's Sheet) fetch updates
+  or send messages; other runs print what they would have sent. A tap on a
+  question that is not open is never dropped silently: it is logged, the
+  message loses its buttons, and the bot says nothing was changed.
+- **Agent state values are copies.** `state.SheetStore.get` / `items` hand out
+  copies, so changing a value in place (as `calendar_sync.answer` does with
+  `calendar_state`) can't make `put` skip the write. Otherwise snoozes, "no"
+  to a cancellation and "Leave this event out" would be lost after every
+  GitHub Actions run, and the questions would come back.
 - **Telegram replies are plain text**, no markdown (`bot.plain` strips it).
 - **Only chat `TELEGRAM_CHAT_ID` is answered**; everyone else is ignored,
   button taps included.
@@ -143,17 +198,36 @@ Most are enforced in code, not only in the prompt. Where both exist, keep both.
 
 ## GitHub Actions
 
-`.github/workflows/agent.yml` runs `bot.py --once` at minute 7 of 00:07 and
-07:07-23:07 Europe/Helsinki (the schedule's `timezone`), with the state in the
+`.github/workflows/agent.yml` runs `bot.py --once`, with the state in the
 Agent state tab, never two runs at once and a 6-minute limit. Its first step
 checks the required secrets and variables; if any is missing it says which
-and exits successfully, so a repository without them never fails on the
-schedule. Scheduled runs use `SCHEDULE_SHEET_TARGET` (default `test`); the
-real Sheet is refused until `REAL_SHEET_APPROVED=true`; `SCHEDULE_ENABLED=false`
-pauses the schedule. A failed run sends a Telegram message. Claude
-authenticates with Workload Identity Federation (`agent.make_client`, the
-`ANTHROPIC_*` variables); never add `ANTHROPIC_API_KEY` there, it would win
-over federation. README.md lists every secret and variable.
+and exits successfully, so a repository without them never fails.
+
+The recommended trigger is an external cron service (README.md, "Trigger it
+from an external cron service"): it starts the workflow through the
+workflow_dispatch API every 30 minutes, with a fine-grained token limited to
+the repository (Actions: read and write) and an expiry. GitHub's own
+schedule is best-effort (often late or skipped), so it is only an optional
+backup: every hour at minute 37 UTC, run as `bot.py --once --scheduled`,
+which does nothing from 01:00 to 06:59 Helsinki time or when a run already
+finished in this Helsinki hour (Agent state key `last_run`).
+`SCHEDULE_ENABLED=false` pauses it. Two runs in one hour do no harm: they
+never overlap, each Telegram update is handled once, open questions are not
+sent again.
+
+Actions minutes (private repository; public repositories don't pay): each run
+is billed as a whole number of minutes, rounded up; runs take 20-100 s, about
+1.2 billed minutes on average. Every 30 minutes for 18 hours a day: 36 runs,
+about 1,350 minutes a month. The backup schedule adds 24 runs a day (each
+starts and installs before it can skip), about 750 a month.
+
+Scheduled runs use `SCHEDULE_SHEET_TARGET` (default `test`); the real Sheet
+is refused until `REAL_SHEET_APPROVED=true`. Only runs on
+`SCHEDULE_SHEET_TARGET` use Telegram; the Run workflow button's default
+("scheduled") picks that Sheet. A failed run sends a Telegram message.
+Claude authenticates with Workload Identity Federation (`agent.make_client`,
+the `ANTHROPIC_*` variables); never add `ANTHROPIC_API_KEY` there, it would
+win over federation. README.md lists every secret and variable.
 
 The federation rule must match the subject GitHub actually sends, which is the
 ID-embedded format `repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main`
@@ -183,11 +257,13 @@ is on the Console's Workload identity history page.
 .venv/bin/python test_bot.py --test-questions "tap:1:no" "tap:2:skip" "3. yes"   # fake calendar questions
 .venv/bin/python test_bot.py --test-questions "1 yes, 2 no" "tap:confirm:answers"
 .venv/bin/python test_bot.py --once "test: note"                 # one-shot mode
+.venv/bin/python test_runs.py      # one-shot runs on the test Sheet's Agent state, taps in between
+.venv/bin/python test_answers.py   # offline: no answered calendar question is asked again
 ```
 
 `reply:3: text` replies to calendar question 3; `tap:3:yes|no|skip` taps its
 button; `tap:confirm:answers|note` answers the "is this a list of answers?"
-question; `tap:note:same_update|same_new|different` taps a same-name button; `--calendar` turns the calendar check on. Test questions and the
+question; `tap:note:same_update|same_new|different` taps a same-name button (`dup_same|dup_different|dup_skip` a duplicate one); `--calendar` turns the calendar check on. Test questions and the
 Telegram offset use their own files, never the live bot's.
 
 ## How to revert
@@ -209,11 +285,13 @@ Revert newer Changes rows first when the same cell changed twice.
 (default `claude-haiku-5-5`), `GOOGLE_SHEET_ID` (real Sheet),
 `GOOGLE_TEST_SHEET_ID`, `SHEET_TARGET` (`test` or `real`),
 `GOOGLE_CALENDAR_ID`, `CALENDAR_SYNC` (`on` for hourly calendar checks),
-`STATE_BACKEND` (`files` or `sheet`), `GOOGLE_SERVICE_ACCOUNT_JSON` (the key's
+`STATE_BACKEND` (`files` or `sheet`), `TELEGRAM_SHEET_TARGET` (the Sheet
+whose runs use Telegram, default `real`), `GOOGLE_SERVICE_ACCOUNT_JSON` (the key's
 contents, instead of `service-account.json`),
 `ACTIVITY_TAB` (default `Activity Log`), `PROJECTS_TAB` (default `Projects`),
 `CATEGORIES` (default `Networking,Outreach,Project,Meeting,Learning,Personal Brand,Preparation`;
-the OKR rules in `okr.py` use these names).
+the OKR rules in `okr.py` use these names), `OWNER_NAMES` (your own names,
+comma-separated; the duplicate check ignores them).
 The bot reads `.env` at start; after changing it, restart the bot.
 
 ## Open items

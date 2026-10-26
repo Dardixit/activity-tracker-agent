@@ -43,7 +43,12 @@ class WriteUnknown(Exception):
 
 
 class WriteRefused(Exception):
-    """Raised before anything is sent: nothing was written."""
+    """Raised before anything is sent: nothing was written. `items` are the
+    edits/inserts the refusal is about (empty when it is about the whole write)."""
+
+    def __init__(self, message, items=()):
+        super().__init__(message)
+        self.items = list(items)
 
 
 def cell(value):
@@ -275,19 +280,19 @@ class Writer:
             where = f"{e['tab']} row {e['row']}, {e['column']}"
 
             if e["row"] > 1 and e["col"] < len(header) and header[e["col"]] != e["column"]:
-                raise WriteRefused(f"{where}: the columns have moved since I read the Sheet.")
+                raise WriteRefused(f"{where}: the columns have moved since I read the Sheet.", [e])
             if current != shown(e["old"]):
                 raise WriteRefused(
-                    f"{where} changed since I read it (was {shown(e['old'])!r}, now {current!r})."
+                    f"{where} changed since I read it (was {shown(e['old'])!r}, now {current!r}).", [e]
                 )
             # Same rules as agent.check_change, checked again on fresh data.
             if e["tab"] == agent.ACTIVITY and agent.LOCKED in header:
                 i = header.index(agent.LOCKED)
                 if len(values) > i and values[i].strip().upper() == "TRUE":
-                    raise WriteRefused(f"{where}: row {e['row']} is locked.")
+                    raise WriteRefused(f"{where}: row {e['row']} is locked.", [e])
             if (e["tab"] == agent.PROJECTS and e["column"] == "Link"
                     and 2 <= e["row"] <= agent.PROJECTS_LINK_LOCKED):
-                raise WriteRefused(f"{where}: Link never changes in rows 2-{agent.PROJECTS_LINK_LOCKED}.")
+                raise WriteRefused(f"{where}: Link never changes in rows 2-{agent.PROJECTS_LINK_LOCKED}.", [e])
 
         # Done/Missed only for dates up to today (Helsinki), checked on each
         # Activity Log row as it will read after the change.
@@ -300,12 +305,13 @@ class Writer:
             after = {**agent.row_as_dict(rows[0], rows[row - 1] if row - 1 < len(rows) else []), **changed}
             problem = agent.past_status_problem(after["Status"], after["Date"])
             if problem:
-                raise WriteRefused(f"{agent.ACTIVITY} row {row}: {problem}")
+                raise WriteRefused(f"{agent.ACTIVITY} row {row}: {problem}", [
+                    e for e in edits if e["tab"] == agent.ACTIVITY and e["row"] == row and e["column"] in changed])
         for ins in inserts:
             v = ins["values"]
             problem = agent.past_status_problem(shown(v.get("Status", "")), shown(v.get("Date", "")))
             if problem:
-                raise WriteRefused(f"New {ins['tab']} row: {problem}")
+                raise WriteRefused(f"New {ins['tab']} row: {problem}", [ins])
 
         requests, logs = [], []
         for e in edits:
@@ -362,6 +368,23 @@ class Writer:
                     e["moved_to"] = final
 
         return self.commit(requests, logs, changes_rows_before=len(fresh[CHANGES]))
+
+    def apply_allowed(self, edits, inserts=()):
+        """Like apply, but a change the checks refuse is left out and the rest
+        is written. Returns (logged, refused), refused being a list of (the
+        edits/inserts left out, why). A refusal about the whole write (the
+        Changes tab's layout) still raises."""
+        edits, inserts, refused = list(edits), list(inserts), []
+        while True:
+            try:
+                return self.apply(edits, inserts), refused
+            except WriteRefused as err:
+                if not err.items:
+                    raise
+                refused.append((err.items, str(err)))
+                left_out = lambda change: any(change is item for item in err.items)
+                edits = [e for e in edits if not left_out(e)]
+                inserts = [i for i in inserts if not left_out(i)]
 
     def place_rows(self, row_numbers, reason):
         """Move these Activity Log rows to their place in date order (a repair).

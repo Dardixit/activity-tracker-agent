@@ -5,6 +5,7 @@ Keys:
 - question:<message id>: one open question, with its paused agent run (bot.py)
 - calendar_state: calendar questions you snoozed or said to ignore
 - runner: "github-actions" once migrate_state.py has moved the bot there
+- last_run: the Helsinki hour of the last one-shot run that finished (bot.py --scheduled)
 
 STATE_BACKEND in .env picks where the state lives:
 - "files" (the default): local files next to the code (last_update_id.txt,
@@ -18,6 +19,7 @@ Agent state writes are bookkeeping, not tracker data, so they are not logged
 in the Changes tab (an approved exception to "every write is logged").
 """
 
+import copy
 import json
 import os
 
@@ -49,6 +51,8 @@ class SheetStore:
         if TAB not in self.writer.sheet_ids:
             raise SystemExit(f"The Sheet has no {TAB!r} tab. Run setup_sheet.py first.")
         rows = self.writer.read([TAB])[TAB]
+        # values: what the tab holds. get() and items() hand out copies, so a
+        # caller changing a value in place can't make put() think it is saved.
         self.values, self.row_of, self.free = {}, {}, []
         for n, cells in enumerate(rows[1:], start=2):
             key = cells[0].strip() if cells else ""
@@ -61,10 +65,10 @@ class SheetStore:
 
     def get(self, key, default=None):
         value = self.values.get(key)
-        return default if value is None else value
+        return default if value is None else copy.deepcopy(value)
 
     def items(self, prefix):
-        return {k: v for k, v in self.values.items() if k.startswith(prefix)}
+        return {k: copy.deepcopy(v) for k, v in self.values.items() if k.startswith(prefix)}
 
     def put(self, changes):
         """Write {key: value} in one request; a value of None removes the key.
@@ -87,7 +91,7 @@ class SheetStore:
                 if key not in self.row_of:
                     self.row_of[key] = self.free.pop(0) if self.free else self._new_row()
                 n = self.row_of[key]
-                self.values[key] = value
+                self.values[key] = copy.deepcopy(value)
                 cells = [key, stamp] + chunks + [""] * (MAX_CHUNKS - len(chunks))
             data.append({"range": f"'{TAB}'!A{n}:{LAST_COLUMN}{n}", "values": [cells]})
         if not data:

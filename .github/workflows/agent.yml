@@ -1,7 +1,16 @@
-# Runs the bot every hour at minute 7, from 07:07 to 00:07 Helsinki time
-# (none from 01:00 to 06:59), as bot.py --once: handles waiting Telegram
-# messages and button taps, runs the calendar check and the OKR recount, then
-# exits. State between runs lives in the Sheet's hidden Agent state tab.
+# Runs the bot as bot.py --once: handles waiting Telegram messages and button
+# taps, runs the calendar check and the OKR recount, then exits. State between
+# runs lives in the Sheet's hidden Agent state tab.
+#
+# Triggers (README.md, "Trigger it from an external cron service"):
+#   - recommended: an external cron service (e.g. cron-job.org) starts this
+#     workflow through the workflow_dispatch API every 30 minutes.
+#   - optional backup: GitHub's schedule, every hour at minute 37 UTC. GitHub
+#     runs schedules on a best-effort basis (often late, often skipped), so it
+#     is only a backup. bot.py --scheduled does nothing from 01:00 to 06:59
+#     Helsinki time or when a run already finished in this Helsinki hour. Two
+#     runs in one hour do no harm: runs never overlap (concurrency), each
+#     Telegram update is handled once, and open questions are not sent again.
 #
 # The first step checks that the required secrets and variables are set. If
 # any is missing (as in the public showcase repository, which has none), the
@@ -14,25 +23,25 @@
 #   ANTHROPIC_SERVICE_ACCOUNT_ID.
 # Optional: secret GOOGLE_CALENDAR_ID (calendar check on when set); variables
 #   ANTHROPIC_WORKSPACE_ID, SCHEDULE_ENABLED ("false" pauses scheduled runs),
-#   SCHEDULE_SHEET_TARGET ("test" by default, or "real"), REAL_SHEET_APPROVED
-#   ("true" allows the real Sheet), ACTIVITY_TAB, PROJECTS_TAB, CATEGORIES.
+#   SCHEDULE_SHEET_TARGET ("test" by default, or "real"; only runs on this
+#   Sheet use Telegram, since the other Sheet's Agent state tab doesn't know
+#   the open questions), REAL_SHEET_APPROVED ("true" allows the real Sheet),
+#   ACTIVITY_TAB, PROJECTS_TAB, CATEGORIES, OWNER_NAMES.
 # No ANTHROPIC_API_KEY: it would take precedence over federation.
 
 name: Agent
 
 on:
   schedule:
-    # 00:07 and 07:07-23:07, Helsinki time with daylight saving time; minute 7
-    # keeps away from the busy top of the hour.
-    - cron: "7 0,7-23 * * *"
-      timezone: "Europe/Helsinki"
+    # UTC; the Helsinki hours are checked by bot.py --scheduled.
+    - cron: "37 * * * *"
   workflow_dispatch:
     inputs:
       sheet:
-        description: Sheet to use
+        description: Sheet to use ("scheduled" = the one scheduled runs use, with Telegram)
         type: choice
-        options: [test, real]
-        default: test
+        options: [scheduled, test, real]
+        default: scheduled
       test_labels:
         description: 'Put "test: " in front of every Changes reason'
         type: boolean
@@ -53,7 +62,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     env:
-      SHEET_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.sheet || vars.SCHEDULE_SHEET_TARGET || 'test' }}
+      SHEET_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.sheet != 'scheduled' && inputs.sheet || vars.SCHEDULE_SHEET_TARGET || 'test' }}
+      TELEGRAM_SHEET_TARGET: ${{ vars.SCHEDULE_SHEET_TARGET || 'test' }}
       REASON_PREFIX: "${{ inputs.test_labels && 'test: ' || '' }}"
       STATE_BACKEND: sheet
       CALENDAR_SYNC: ${{ secrets.GOOGLE_CALENDAR_ID != '' && 'on' || 'off' }}
@@ -70,6 +80,7 @@ jobs:
       ACTIVITY_TAB: ${{ vars.ACTIVITY_TAB }}
       PROJECTS_TAB: ${{ vars.PROJECTS_TAB }}
       CATEGORIES: ${{ vars.CATEGORIES }}
+      OWNER_NAMES: ${{ vars.OWNER_NAMES }}
     steps:
       - name: Check secrets and variables
         id: config
@@ -109,7 +120,7 @@ jobs:
 
       - name: Run the agent once
         if: steps.config.outputs.ok == 'true'
-        run: python bot.py --once --reason-prefix "$REASON_PREFIX"
+        run: python bot.py --once --reason-prefix "$REASON_PREFIX" ${{ github.event_name == 'schedule' && '--scheduled' || '' }}
 
       - name: Tell Telegram the run failed
         if: failure() && steps.config.outputs.ok == 'true'

@@ -30,6 +30,9 @@ ACTIVITY_TAB = os.getenv("ACTIVITY_TAB", "").strip() or "Activity Log"
 PROJECTS_TAB = os.getenv("PROJECTS_TAB", "").strip() or "Projects"
 DEFAULT_CATEGORIES = "Networking,Outreach,Project,Meeting,Learning,Personal Brand,Preparation"
 CATEGORIES = [c.strip() for c in (os.getenv("CATEGORIES", "").strip() or DEFAULT_CATEGORIES).split(",") if c.strip()]
+# The owner's own names (first and last), comma-separated: calendar titles
+# often carry them, so the duplicate check ignores them (agent.OWN_NAMES).
+OWNER_NAMES = [n.strip() for n in os.getenv("OWNER_NAMES", "").split(",") if n.strip()]
 TAB_NAME = ACTIVITY_TAB
 
 # "readonly" means Google itself refuses any write from these credentials,

@@ -293,6 +293,14 @@ TOOLS = [
                         "Same person, new row / Different person."
                     ),
                 },
+                "duplicate_row": {
+                    "type": "integer",
+                    "description": (
+                        "Set (to the Activity Log row) when propose_change said a new row looks like a calendar "
+                        "row on the same day. The user then answers with buttons: Same, link to existing row / "
+                        "Different, add row / Skip."
+                    ),
+                },
             },
             "required": ["question"],
             "additionalProperties": False,
@@ -302,6 +310,10 @@ TOOLS = [
 
 # Words too common to say anything about which row a note is about.
 STOP_WORDS = {"the", "for", "and", "with", "at", "on", "in", "to", "of", "a", "an", "my", "me"}
+# The owner's own names (OWNER_NAMES in .env): calendar titles often carry them
+# ("Alex Example for Product Lead | ..."), so they say nothing about which row
+# an event is about.
+OWN_NAMES = {w.lower() for name in sheets.OWNER_NAMES for w in re.findall(r"\w+", name)}
 
 
 def words(text):
@@ -352,6 +364,59 @@ COMMON_WORDS = {"follow", "up", "with", "met", "meeting", "coffee", "call", "kic
                 "session", "message", "chat", "lunch", "talk", "webinar", "workshop", "project"}
 
 
+def ordinary_words(data):
+    """Words that are not names: COMMON_WORDS, words the Sheet also uses in
+    lower case, and Status/Category words."""
+    ordinary = set(COMMON_WORDS)
+    for tab in data.values():
+        for row in tab["rows"]:
+            ordinary |= {w for w in re.findall(r"\w+", " ".join(row)) if w[:1].islower()}
+    for column in ("Status", "Category"):
+        ordinary |= {w.lower() for v in allowed_values(data, column) for w in v.split()}
+    return ordinary
+
+
+def activity_key(text):
+    """An Activity without numbers and small words: "Call 3 with Alex" -> "call alex"."""
+    return " ".join(w for w in re.findall(r"[^\W\d_]+", text.lower()) if w not in STOP_WORDS)
+
+
+def twin_rows(data, fields, rows=None):
+    """Activity Log rows on the same day as the new row `fields` that name the
+    same person (or company, event) or have the same activity name, as
+    [(row, why)]. Linked or not, open or done; `rows` limits the search.
+
+    Names are the capitalised words of the new row's Activity and Description
+    that are not ordinary words (see ordinary_words), plus the word after
+    "with"/"met"; your own names (OWN_NAMES) never count."""
+    span = date_span(fields.get("Date", ""))
+    if not span:
+        return []
+    text = f'{fields.get("Activity", "")} {fields.get("Description", "")}'
+    ordinary = ordinary_words(data)
+    names = {w.lower() for w in re.findall(r"\w+", text) if w[:1].isupper() and w.lower() not in ordinary}
+    names |= {w.lower() for w in PERSON_CUE_RE.findall(text)}
+    names -= STOP_WORDS | OWN_NAMES
+    key = activity_key(fields.get("Activity", ""))
+    tab = data[ACTIVITY]
+    out = []
+    for n, values in enumerate(tab["rows"], start=2):
+        if rows is not None and n not in rows:
+            continue
+        r = row_as_dict(tab["header"], values)
+        other = date_span(r["Date"])
+        if not other or other[1] < span[0] or other[0] > span[1]:
+            continue
+        other_key = activity_key(r["Activity"])
+        shared = sorted(w for w in names if term_matches(w, words(f'{r["Activity"]} {r["Description"]}')))
+        if key and other_key and (key == other_key or (len(key.split()) >= 2 and f" {key} " in f" {other_key} ")
+                                  or (len(other_key.split()) >= 2 and f" {other_key} " in f" {key} ")):
+            out.append((n, "same activity name"))
+        elif shared:
+            out.append((n, "both name " + ", ".join(w.capitalize() for w in shared)))
+    return out
+
+
 def unknown_names(data, fields, texts, existing=None):
     """Capitalised words in new or changed cells that the user never wrote.
 
@@ -366,12 +431,7 @@ def unknown_names(data, fields, texts, existing=None):
     """
     existing = existing or {}
     said = words(" ".join(texts))
-    ordinary = set(COMMON_WORDS)
-    for tab in data.values():
-        for row in tab["rows"]:
-            ordinary |= {w for w in re.findall(r"\w+", " ".join(row)) if w[:1].islower()}
-    for column in ("Status", "Category"):
-        ordinary |= {w.lower() for v in allowed_values(data, column) for w in v.split()}
+    ordinary = ordinary_words(data)
     found = []
     for column, value in fields.items():
         if column in NOT_NAMES:
@@ -466,6 +526,28 @@ PERSON_CHOICES = [
     ("different", "Different person",
      "add a new row for the note; the existing row(s) are about someone else"),
 ]
+# Answers to a same-day duplicate question (ask_user with duplicate_row), as
+# Telegram buttons: (value, label, what the agent is told).
+DUPLICATE_CHOICES = [
+    ("dup_same", "Same, link to existing row",
+     "it is the same as the calendar row: add no new row; put what the note adds into that row instead (if it is "
+     "locked, or the row already says it, propose nothing for it)"),
+    ("dup_different", "Different, add row", "add the new row; the calendar row is something else and stays as it is"),
+    ("dup_skip", "Skip", "add nothing for it: propose no new row for this, and nothing else from this question"),
+]
+# The `decided` key once the duplicate question has been answered in a run.
+DUPLICATE_KEY = "#calendar duplicate"
+
+
+def question_choices(question):
+    """The buttons of a note question: same-name or duplicate, else none."""
+    if question.get("person"):
+        return PERSON_CHOICES
+    if question.get("duplicate"):
+        return DUPLICATE_CHOICES
+    return []
+
+
 # Words before a capitalised word that make it a person's name ("Coffee with Alex").
 PERSON_CUE_RE = re.compile(r"\b(?:with|met|meet|meeting)\s+([A-Z]\w+)")
 
@@ -552,6 +634,50 @@ def person_problem(data, change, decided):
     return None, None
 
 
+def calendar_rows(data):
+    """Activity Log rows that came from or are linked to the calendar."""
+    tab = data[ACTIVITY]
+    out = set()
+    for n, values in enumerate(tab["rows"], start=2):
+        r = row_as_dict(tab["header"], values)
+        if r.get(EVENT_ID, "").strip() or r.get(SOURCE, "") == "calendar":
+            out.add(n)
+    return out
+
+
+def duplicate_problem(data, change, decided):
+    """((row, why), why this add must wait for a duplicate question), or
+    (None, None) if it may go ahead.
+
+    A new Activity Log row on the same day as a calendar row that names the
+    same person or has the same activity name is only added after the user
+    said whether it is the same thing."""
+    if change["action"] != "add" or change.get("tab") != ACTIVITY or DUPLICATE_KEY in decided:
+        return None, None
+    twins = twin_rows(data, change["fields"], rows=calendar_rows(data))
+    if not twins:
+        return None, None
+    row, why = twins[0]
+    r = row_as_dict(data[ACTIVITY]["header"], data[ACTIVITY]["rows"][row - 2])
+    return (row, why), (f"Row {row} ({r['Date']} | {r['Activity']}) comes from the calendar, is on the same day and "
+                        f"looks like the same thing ({why}). Do not add this row yet. Call ask_user with "
+                        f"duplicate_row={row}; the code writes the question. The user answers with buttons: "
+                        + " / ".join(f'"{label}"' for _, label, _ in DUPLICATE_CHOICES)
+                        + ". Propose nothing else in this turn.")
+
+
+def duplicate_question(data, row, why):
+    """The duplicate question as the user sees it, written by the code so it matches the buttons."""
+    tab = data[ACTIVITY]
+    r = row_as_dict(tab["header"], tab["rows"][row - 2])
+    cells = " | ".join(r[c] for c in ("Date", "Status", "Category", "Activity", "Description") if r.get(c))
+    return (f"Your note adds a row that looks like Activity Log row {row}, which comes from the calendar and is on "
+            f"the same day ({why}):\n- {cells}\n\nIs it the same?\n"
+            f"- Same, link to existing row: I add no new row; what the note adds goes into row {row}.\n"
+            f"- Different, add row: I add the new row and leave row {row} as it is.\n"
+            f"- Skip: I add nothing for this.")
+
+
 # -------------------------------------------------------------------- Prompt
 
 def system_prompt(data):
@@ -607,6 +733,10 @@ Rules (propose_change enforces the row rules and allowed values):
   name. The code writes the question the user sees (the rows found and what each button does), so a short
   question is enough. The user answers with buttons ("Same person, update existing row" / "Same person, new
   row" / "Different person"). Then do what the answer says. propose_change rejects such a row until this was asked, and every add must list its people.
+- A new Activity Log row on the same day as a calendar row about the same person or with the same activity name
+  is rejected until you call ask_user with duplicate_row set to that row. The code writes the question; the
+  user answers with buttons ("Same, link to existing row" / "Different, add row" / "Skip"). Then do what the
+  answer says.
 - Only use facts from the note and the Sheet. Do not invent surnames, companies or details. Every name of a
   person, company or event you write, in a new row or an update, must be one the user wrote (names already in
   the cell you are updating may stay); propose_change rejects any other name.
@@ -639,6 +769,11 @@ def run_tool(data, name, args, run):
         if problem:
             problems.append(problem)
             run["needs_person"] = name or run["needs_person"]
+        elif not problems:
+            twin, problem = duplicate_problem(data, args, run["decided"])
+            if problem:
+                problems.append(problem)
+                run["needs_duplicate"] = twin
         if problems:
             return "Rejected:\n- " + "\n- ".join(problems), True
         run["proposals"].append(args)
@@ -670,7 +805,7 @@ def new_run():
     # person: the first name the open question is about (it gets buttons).
     return {"proposals": [], "asked": False, "question": None, "final_text": "",
             "problem": None, "pending": None, "texts": [], "warned_ask": False,
-            "decided": {}, "needs_person": None, "person": None}
+            "decided": {}, "needs_person": None, "person": None, "needs_duplicate": None, "duplicate": None}
 
 
 def start(client, data, note):
@@ -688,12 +823,48 @@ def continue_run(client, data, pending, answer, choice=None):
     content = f"The user answered (today is {today}): {answer}"
     if pending.get("person"):
         decided[pending["person"].lower()] = choice or "answered in words"
-        meaning = {value: told for value, _, told in PERSON_CHOICES}.get(choice)
-        if meaning:
-            content += f"\nThat means: {meaning}."
+    elif pending.get("duplicate"):
+        decided[DUPLICATE_KEY] = choice or "answered in words"
+    meaning = {value: told for value, _, told in question_choices(pending)}.get(choice)
+    if meaning:
+        content += f"\nThat means: {meaning}."
     results = pending["results"] + [{"type": "tool_result", "tool_use_id": pending["ask_id"], "content": content}]
     messages = pending["messages"] + [{"role": "user", "content": results}]
     return run_loop(client, data, messages, pending.get("texts", []) + [answer], decided)
+
+
+# A paused run is saved with Claude's thinking blocks, which are only valid for
+# the system prompt and tools they were made with. A question asked before a
+# code change must still work after it: such blocks are dropped, not refused.
+THINKING = {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+THINKING_BETAS = ["thinking-binding-controls-2026-08-01"]
+
+
+def without_thinking(messages):
+    """The messages with every thinking block taken out of assistant turns."""
+    out = []
+    for m in messages:
+        content = m["content"]
+        if m["role"] == "assistant" and isinstance(content, list):
+            content = [b for b in content if (b.get("type") if isinstance(b, dict) else b.type)
+                       not in ("thinking", "redacted_thinking")]
+        out.append({**m, "content": content})
+    return out
+
+
+def create_message(client, messages, **kwargs):
+    """One model call. Thinking blocks the API can't check against this
+    conversation are dropped (THINKING). Should the API still refuse one, the
+    thinking blocks are taken out of `messages` (in place) and the call is
+    made again without them."""
+    try:
+        return client.beta.messages.create(messages=messages, thinking=THINKING, betas=THINKING_BETAS, **kwargs)
+    except anthropic.BadRequestError as err:
+        if "thinking" not in str(err):
+            raise
+        print(f"  Claude refused the saved thinking blocks, so they are left out: {err}")
+        messages[:] = without_thinking(messages)
+        return client.messages.create(messages=messages, **kwargs)
 
 
 def run_loop(client, data, messages, texts, decided=None):
@@ -703,13 +874,13 @@ def run_loop(client, data, messages, texts, decided=None):
     step = 0
 
     for _ in range(MAX_TURNS):
-        response = retry.call("Claude", lambda: client.messages.create(
+        response = retry.call("Claude", lambda: create_message(
+            client, messages,
             model=MODEL,
             max_tokens=16000,
             output_config={"effort": "medium"},
             system=system_prompt(data),
             tools=TOOLS,
-            messages=messages,
         ))
 
         if response.stop_reason == "refusal":
@@ -764,6 +935,12 @@ def run_loop(client, data, messages, texts, decided=None):
                 if run["person"] and rows_naming(data, run["person"]):
                     # The user sees the code's wording, which matches the buttons.
                     run["question"] = person_question(data, run["person"])
+                elif not run["person"] and (run["needs_duplicate"] or call.input.get("duplicate_row")):
+                    # The code's own match wins over the row the agent named.
+                    row, why = run["needs_duplicate"] or (call.input["duplicate_row"], "same day")
+                    if 2 <= row < len(data[ACTIVITY]["rows"]) + 2:
+                        run["duplicate"] = row
+                        run["question"] = duplicate_question(data, row, why)
                 print("    (paused: question for the user)")
                 continue
             if call.name == "ask_user":
@@ -785,7 +962,8 @@ def run_loop(client, data, messages, texts, decided=None):
             # is written while a question is open.
             run["proposals"] = []
             run["pending"] = {"messages": to_json(messages), "results": results, "ask_id": ask_id,
-                              "texts": texts, "decided": run["decided"], "person": run["person"]}
+                              "texts": texts, "decided": run["decided"], "person": run["person"],
+                              "duplicate": run["duplicate"]}
             break
         messages.append({"role": "user", "content": results})
         # A turn of nothing but accepted proposals means the agent is done. The
@@ -820,7 +998,7 @@ def format_proposal(data, p):
 def format_reply(data, run):
     """A dry-run result as plain text (dry_run.py; the bot reports real writes itself)."""
     if run["asked"]:
-        buttons = " / ".join(f"[{label}]" for _, label, _ in PERSON_CHOICES) if run["person"] else ""
+        buttons = " / ".join(f"[{label}]" for _, label, _ in question_choices(run))
         return "Question before I change anything:\n\n" + run["question"] + (f"\n\n{buttons}" if buttons else "")
     if run["problem"]:
         return "Something went wrong: " + run["problem"]

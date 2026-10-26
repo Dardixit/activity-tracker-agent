@@ -10,8 +10,9 @@ latest question the bot asked, e.g.  "reply: yes, 26.10 is right";
 "reply:3: same row" replies to calendar question 3 of the latest set.
 "tap:3:no" taps a button (its value: yes/no/skip) on calendar question 3, and
 "tap:confirm:answers" / "tap:confirm:note" taps the "is this a list of answers?"
-question, and "tap:note:same_new" (same_update/same_new/different) taps a button
-on the latest same-name question. --test-questions first sends four fake calendar questions (titles
+question, and "tap:note:same_new" (same_update/same_new/different, or
+dup_same/dup_different/dup_skip) taps a button on the latest same-name or
+duplicate question. --test-questions first sends four fake calendar questions (titles
 starting with "test:"), so buttons can be tested without real events.
 
 Writes go to the target Sheet like real messages, but every Changes row they
@@ -123,6 +124,9 @@ def main(args):
     bot.OFFSET_FILE = here / "last_update_id.test.txt"
     bot.PENDING_FILE = here / "pending_questions.test.json"
     bot.state.BACKEND = "files"
+    # Telegram is faked, so it belongs to this test's Sheet (also for --test-questions, sent before main()).
+    bot.TELEGRAM_SHEET_TARGET = bot.agent.sheets.SHEET_TARGET
+    bot.telegram_on = True
     telegram = bot.requests = FakeTelegram(messages, once)
     real_send = bot.send
 

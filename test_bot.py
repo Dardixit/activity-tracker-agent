@@ -63,10 +63,11 @@ class FakeTelegram:
         self.last_question = None  # id of the latest bot message that was stored as a question
         self.by_number = {}        # calendar question number -> message id (latest set)
         self.last_confirm = None
+        self.links = {}            # message id -> the links on its buttons
 
     def get(self, url, params=None, timeout=None):
         if url.endswith("/getMe"):
-            return FakeResponse({"ok": True, "result": {"username": "test-bot (Telegram faked)"}})
+            return FakeResponse({"ok": True, "result": {"username": "test_bot"}})
         if url.endswith("/getUpdates"):
             if not self.messages:
                 if self.once:
@@ -79,10 +80,10 @@ class FakeTelegram:
                 mid = {"confirm": self.last_confirm, "note": self.last_question}.get(target) \
                     or self.by_number[int(target)]
                 print("\n" + "=" * 78 + f"\nTEST TAP: button {value!r} on message {mid}\n" + "=" * 78)
-                me = {"id": bot.ALLOWED_CHAT_ID}
-                callback = {"id": f"cb{self.next_update}", "from": me, "data": value,
-                            "message": {"message_id": mid, "chat": {"id": bot.ALLOWED_CHAT_ID}}}
-                return FakeResponse({"ok": True, "result": [{"update_id": self.next_update, "callback_query": callback}]})
+                # What Telegram does with a link button: your app sends the
+                # link's start parameter as a message.
+                link = next(u for u in self.links[mid] if u.endswith(f"_{value}"))
+                text = "/start " + link.split("?start=", 1)[1]
             message = {"chat": {"id": bot.ALLOWED_CHAT_ID}, "text": text}
             if text.startswith("reply:"):
                 rest = text[len("reply:"):]
@@ -100,13 +101,14 @@ class FakeTelegram:
     def post(self, url, data=None, timeout=None):
         if url.endswith("/sendMessage"):
             self.next_message_id += 1
-            buttons = ""
-            if data.get("reply_markup"):
-                rows = json.loads(data["reply_markup"])["inline_keyboard"]
-                buttons = "\n" + "  ".join(f"[{b['text']}]" for row in rows for b in row)
-            print(f"\n######## TELEGRAM REPLY (message {self.next_message_id}) ########\n{data['text']}{buttons}\n"
+            print(f"\n######## TELEGRAM REPLY (message {self.next_message_id}) ########\n{data['text']}\n"
                   "################################")
             return FakeResponse({"ok": True, "result": {"message_id": self.next_message_id}})
+        if url.endswith("/editMessageReplyMarkup"):
+            rows = json.loads(data.get("reply_markup") or '{"inline_keyboard": []}')["inline_keyboard"]
+            self.links[data["message_id"]] = [b["url"] for row in rows for b in row]
+            print(f"######## BUTTONS of message {data['message_id']}: "
+                  + "  ".join(f"[{b['text']}]" for row in rows for b in row))
         if url.endswith("/editMessageText"):
             print(f"\n######## EDITED message {data['message_id']} (buttons removed) ########\n{data['text']}\n"
                   "################################")

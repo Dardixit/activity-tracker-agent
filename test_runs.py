@@ -5,16 +5,20 @@ tab of the test Sheet (STATE_BACKEND=sheet), the calendar check on, the real
 calendar and Claude. Nothing survives between runs except what is saved in the
 Sheet, as on GitHub Actions. The fake Telegram keeps its waiting updates and
 sent messages in telegram_fake.test.json between runs, and drops updates once
-a run confirms them (getUpdates with a higher offset), as Telegram does.
+a run confirms them (getUpdates with a higher offset), as Telegram does, and
+loses a callback_query older than 150 seconds, as Telegram does: this is why
+real buttons are links, and the taps here press the link on the button.
 
-  run 1      asks questions (calendar check)
-  (between)  your taps wait in Telegram: every question gets a button tap
-             (attend: yes, cancel: no, the rest: skip), plus one tap on a
-             message that is no question
+  run 1      gets a note naming a person already in the Sheet (the same-name
+             question) and asks questions (calendar check)
+  (between)  your taps wait in Telegram for 30 minutes: every question gets a
+             button tap (same name: Same person, new row; attend: yes, cancel:
+             no, the rest: skip), plus one tap on a message that is no question
   run 1b     a run on the other Sheet (TELEGRAM_SHEET_TARGET=real): must not
              fetch the waiting taps or send anything
   run 2      gets the taps: each is applied, its question closed in the
-             Agent state tab; the stray tap is answered "not open any more"
+             Agent state tab, the new row is in the Sheet; the stray tap is
+             answered "not open any more"
   run 3      asks nothing that runs 1 and 2 asked
   run 4      the backup schedule in the same hour (--scheduled): does nothing
              (outside 01:00-06:59 Helsinki time)
@@ -36,6 +40,11 @@ FAKE_FILE = HERE / "telegram_fake.test.json"
 FIRST_MESSAGE_ID = 900000  # fake message ids start above the real ones
 STRAY_MESSAGE = 1  # a message id no question has
 TAP_VALUE = {"attend": "yes", "cancel": "no"}  # everything else: skip
+CALLBACK_LIFETIME = 150  # seconds Telegram keeps a callback_query update
+RUN_INTERVAL = 1800  # seconds between one-shot runs
+# Use a first name already in your test Sheet: this new row needs the same-name question.
+NOTE_DATE = "12.11.2026"
+NOTE = f"test: add a new row: follow up with Anna on {NOTE_DATE}"
 
 
 class FakeResponse:
@@ -58,11 +67,12 @@ class PersistentTelegram:
 
     def get(self, url, params=None, timeout=None):
         if url.endswith("/getMe"):
-            return FakeResponse({"ok": True, "result": {"username": "test-bot (Telegram faked)"}})
+            return FakeResponse({"ok": True, "result": {"username": "test_bot"}})
         if url.endswith("/getUpdates"):
             self.s["calls"].append({"run": self.run, "method": "getUpdates", "offset": params["offset"]})
             # A higher offset confirms the updates below it: Telegram deletes them.
-            self.s["waiting"] = [u for u in self.s["waiting"] if u["update_id"] >= params["offset"]]
+            self.s["waiting"] = [u for u in self.s["waiting"] if u["update_id"] >= params["offset"]
+                                 and ("callback_query" not in u or u["age"] <= CALLBACK_LIFETIME)]
             self.save()
             return FakeResponse({"ok": True, "result": self.s["waiting"]})
         raise ValueError(f"Unexpected GET {url}")
@@ -70,12 +80,14 @@ class PersistentTelegram:
     def post(self, url, data=None, timeout=None):
         method = url.rsplit("/", 1)[1]
         self.s["calls"].append({"run": self.run, "method": method, **{k: data.get(k) for k in ("message_id", "text")}})
+        if method == "editMessageReplyMarkup":
+            rows = json.loads(data.get("reply_markup") or '{"inline_keyboard": []}')["inline_keyboard"]
+            self.s["buttons"][str(data["message_id"])] = [b for row in rows for b in row]
         result = True
         if method == "sendMessage":
             self.s["next_message_id"] += 1
             result = {"message_id": self.s["next_message_id"]}
-            self.s["sent"].append({"run": self.run, "message_id": self.s["next_message_id"], "text": data["text"],
-                                   "buttons": bool(data.get("reply_markup"))})
+            self.s["sent"].append({"run": self.run, "message_id": self.s["next_message_id"], "text": data["text"]})
         self.save()
         return FakeResponse({"ok": True, "result": result})
 
@@ -110,6 +122,13 @@ def open_questions():
     return found, store.get("calendar_state", {})
 
 
+def note_rows():
+    """Activity Log rows the note would add."""
+    os.environ.update(SHEET_TARGET="test")
+    import agent
+    return [row for row in agent.load_sheet()[agent.ACTIVITY]["rows"] if row[0].startswith(NOTE_DATE) and "Anna" in " ".join(row)]
+
+
 def clear_fake_questions():
     """Close questions an earlier test_runs.py left open (fake message ids), and
     return the saved Telegram offset: fake updates must be numbered above it."""
@@ -122,8 +141,11 @@ def clear_fake_questions():
 
 def main():
     offset = clear_fake_questions()
+    chat = int(os.environ.get("TELEGRAM_CHAT_ID") or __import__("dotenv").dotenv_values(HERE / ".env")["TELEGRAM_CHAT_ID"])
+    note = {"update_id": offset + 1000, "message": {"chat": {"id": chat}, "text": NOTE}}
     FAKE_FILE.write_text(json.dumps({"next_message_id": FIRST_MESSAGE_ID, "next_update": offset + 1000,
-                                     "waiting": [], "sent": [], "calls": []}))
+                                     "waiting": [note], "sent": [], "calls": [], "buttons": {}}))
+    rows_before = len(note_rows())
     results = []
 
     def check(ok, text):
@@ -143,17 +165,30 @@ def main():
     keys_asked = {v[1] for v in asked.values() if v[1]}
 
     # Your taps, waiting in Telegram until a run fetches them.
-    chat = int(os.environ.get("TELEGRAM_CHAT_ID") or __import__("dotenv").dotenv_values(HERE / ".env")["TELEGRAM_CHAT_ID"])
+    person = [mid for mid, v in new.items() if v[2].get("person")]
+    check(len(person) == 1 and person == [q["message_id"] for q in s["sent"] if "Is the note about the same Anna?" in q["text"]],
+          "run 1 asked the same-name question about Anna once")
     taps = {}
     for mid, (kind, key, q) in sorted(new.items()):
-        value = TAP_VALUE.get(q["items"][0]["kind"], "skip") if kind == "calendar" else "dup_skip"
+        value = TAP_VALUE.get(q["items"][0]["kind"], "skip") if kind == "calendar" \
+            else "same_new" if q.get("person") else "dup_skip"
         taps[mid] = (value, key)
-    for mid in list(taps) + [STRAY_MESSAGE]:
+    buttons = [b for mid in taps for b in s["buttons"].get(str(mid), [])]
+    check(buttons and all("url" in b and "callback_data" not in b for b in buttons),
+          f"all {len(buttons)} buttons of the questions are links (a callback tap dies after 150 s)")
+    for mid, (value, _) in taps.items():
+        link = next(b["url"] for b in s["buttons"][str(mid)] if b["url"].endswith(f"_{value}"))
         s["next_update"] += 1
-        value = taps[mid][0] if mid in taps else "yes"
-        s["waiting"].append({"update_id": s["next_update"], "callback_query": {
-            "id": f"cb{s['next_update']}", "from": {"id": chat}, "data": value,
-            "message": {"message_id": mid, "chat": {"id": chat}, "text": "an old question"}}})
+        s["waiting"].append({"update_id": s["next_update"], "message": {
+            "chat": {"id": chat}, "text": "/start " + link.split("?start=", 1)[1]}})
+    s["next_update"] += 1
+    s["waiting"].append({"update_id": s["next_update"], "message": {
+        "chat": {"id": chat}, "text": f"/start q{STRAY_MESSAGE}_yes"}})
+    # An old-style tap, as the buttons were: it is gone before the next run.
+    s["next_update"] += 1
+    s["waiting"].append({"update_id": s["next_update"], "age": RUN_INTERVAL, "callback_query": {
+        "id": "cb-too-old", "from": {"id": chat}, "data": "yes",
+        "message": {"message_id": STRAY_MESSAGE, "chat": {"id": chat}, "text": "an old question"}}})
     FAKE_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=1))
     print("\nTaps waiting in Telegram: " + ", ".join(f"{v[0]} on {mid} ({v[1]})" for mid, v in taps.items())
           + f", yes on message {STRAY_MESSAGE} (no question)")
@@ -163,22 +198,25 @@ def main():
     check(status == 0, f"run 1b exit status {status}")
     check(not any(c["method"] == "getUpdates" for c in calls), "run 1b (other Sheet) fetched no updates")
     check(not any(c["method"] == "sendMessage" for c in calls), "run 1b (other Sheet) sent nothing")
-    check(len(s["waiting"]) == len(taps) + 1, f"all {len(taps) + 1} taps still waiting after run 1b")
+    check(len(s["waiting"]) == len(taps) + 2, f"all {len(taps) + 1} taps still waiting after run 1b")
 
     status, s = child("2")
     check(status == 0, f"run 2 exit status {status}")
     check(not s["waiting"], "run 2 fetched and confirmed every waiting tap")
     after, state_cal = open_questions()
     check(not set(taps) & set(after), "every tapped question is closed in the Agent state tab")
+    check(len(note_rows()) == rows_before + 1, "Same person, new row: exactly one row added for the note")
+    check(any("Your answer: Same person, new row" in (c.get("text") or "") for c in s["calls"] if c["run"] == "2"),
+          "the same-name question's message shows the answer instead of the buttons")
     for mid, (value, key) in taps.items():
         if value == "skip":
             check(key in state_cal.get("snoozed", {}), f"skip on {key}: snoozed in calendar_state")
         if value == "no" and key.startswith("cancel:"):
             check(key.split(":", 1)[1] in state_cal.get("ignore_cancel", []), f"no on {key}: in ignore_cancel")
     run2 = [c for c in s["calls"] if c["run"] == "2"]
-    check(any(c["method"] == "editMessageText" and c["message_id"] == STRAY_MESSAGE for c in run2),
+    check(any(c["method"] == "editMessageReplyMarkup" and c["message_id"] == STRAY_MESSAGE for c in run2),
           "the tap on a message with no question took its buttons away")
-    check(any(c["method"] == "sendMessage" and "not open any more" in (c["text"] or "") for c in run2),
+    check(any(c["method"] == "sendMessage" and "not open any more" in (c.get("text") or "") for c in run2),
           "the tap on a message with no question was answered with a message")
     keys_asked |= {v[1] for v in after.values() if v[1]}
 

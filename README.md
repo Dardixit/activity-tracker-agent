@@ -52,7 +52,10 @@ This is a showcase copy of a personal project. Names in examples are placeholder
 - **Ask-the-user buttons.** Questions arrive as Telegram messages. A paused run
   is saved to disk and continued with your answer as the tool result. Same-name
   checks and calendar questions come with inline buttons; you can also reply
-  in words, or `/skip`.
+  in words, or `/skip`. The buttons are `t.me` links, not callback buttons:
+  Telegram keeps a callback tap for only 150 seconds but a message for 24 hours,
+  so with a run every 30 minutes a tap has to be a message to survive. Any other
+  `/start` is never treated as a note.
 - **Calendar sync.** `calendar_sync.py` links events to rows, adds missing ones,
   moves rows whose event moved, and asks about cancellations and attendance.
   It remembers per-title decisions in a hidden `Calendar titles` tab.

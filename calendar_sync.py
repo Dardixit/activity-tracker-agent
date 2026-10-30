@@ -277,7 +277,8 @@ def answer_label(item, answer):
 
 def single_question(item, number, total):
     """The text of one question message."""
-    return f"Calendar question {number} of {total}:\n\n{question_text(item, hints=False)}"
+    return (f"Calendar question {number} of {total}:\n\n{question_text(item, hints=False)}\n\n"
+            "(A tap is handled at the next check, within 30 minutes.)")
 
 
 # A numbered list of answers: "1 yes, 2 no" or one "3. Yes" per line.

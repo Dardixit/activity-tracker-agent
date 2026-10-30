@@ -30,7 +30,8 @@ install packages with `uv pip install --python .venv/bin/python <package>`.
 | `test_bot.py` | Runs `bot.main()` with Telegram faked; test writes are labelled. |
 | `test_continue.py` | Saves a question, changes the system prompt and tools, and continues it (calls Claude; writes nothing). |
 | `test_answers.py` | Offline: every calendar question kind and answer; the next check never asks it again (Skip: after 7 days); refused writes and "Try again" included. |
-| `test_runs.py` | Three `bot.py --once` runs on the test Sheet, each its own process with the Agent state tab, Telegram faked: question asked, tap applied and question closed, nothing asked again; a run on the other Sheet leaves the taps alone. |
+| `test_runs.py` | Three `bot.py --once` runs on the test Sheet, each its own process with the Agent state tab, Telegram faked (a callback tap expires after 150 s, as on Telegram): same-name and calendar questions asked, taps on the link buttons applied and questions closed, nothing asked again; a run on the other Sheet leaves the taps alone. |
+| `test_taps.py` | Offline: every kind of question button reaches its question; old buttons are swapped in place; a tap on a closed question says so; `/start` is never a note. |
 | `revert.py` | Undoes Changes rows. |
 | `repair_rows.py` | Puts agent rows that are out of date order or lack dropdowns back in place. |
 | `dry_run.py` | Runs the agent on a note and prints the proposal; never writes. |
@@ -167,6 +168,16 @@ Most are enforced in code, not only in the prompt. Where both exist, keep both.
 - **Telegram replies are plain text**, no markdown (`bot.plain` strips it).
 - **Only chat `TELEGRAM_CHAT_ID` is answered**; everyone else is ignored,
   button taps included.
+- **Question buttons are links, not callback buttons.** Telegram keeps a
+  `callback_query` update for only 150 seconds (a message: 24 hours), so with a
+  run every 30 minutes nearly every callback tap expires unseen, and
+  `getWebhookInfo` shows nothing. Each button is
+  `t.me/<bot>?start=q<message id>_<value>`: the tap sends that as a message,
+  which waits for the next run (`bot.TAP_RE`, `bot.handle_tap`). The links hold
+  the message id, so buttons are added right after sending; open questions
+  still carrying callback buttons are swapped once (`bot.migrate_buttons`).
+- **/start is never a note.** Any other `/start` message gets a short reply and
+  nothing else: no agent run, and it answers no question.
 - **Network errors never stop the bot.** Telegram, Sheets, Calendar and
   Claude calls go through `retry.call` / `retry.execute`: one log line per
   failure, then a retry with growing delay (max 60 s). The polling loop
@@ -259,6 +270,7 @@ is on the Console's Workload identity history page.
 .venv/bin/python test_bot.py --once "test: note"                 # one-shot mode
 .venv/bin/python test_runs.py      # one-shot runs on the test Sheet's Agent state, taps in between
 .venv/bin/python test_answers.py   # offline: no answered calendar question is asked again
+.venv/bin/python test_taps.py      # offline: every button's link reaches its question; /start is never a note
 ```
 
 `reply:3: text` replies to calendar question 3; `tap:3:yes|no|skip` taps its

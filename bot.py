@@ -13,6 +13,8 @@ whether it answers them.
 
 Calendar questions come one per message with buttons; a tap answers exactly
 that question, and the message then shows the answer instead of the buttons.
+Buttons are t.me links, so a tap is a message that waits for the next run: see
+TAP_RE.
 After every run that isn't a question, the OKRs tab is recounted.
 
 With CALENDAR_SYNC=on, the Google Calendar is checked at start and then every
@@ -102,9 +104,18 @@ OFFSET_FILE = Path(__file__).with_name("last_update_id.txt")
 # Calendar questions sent together share a group; "number" is their n of total.
 PENDING_FILE = Path(__file__).with_name("pending_questions.json")
 
+# A button tap. Telegram keeps a callback_query update for only 150 seconds but
+# a message for 24 hours, and a one-shot run comes every 30 minutes, so buttons
+# with callback_data lose nearly every tap. Each button is a t.me link instead:
+# tapping it makes the user's app send "/start q<message id>_<value>".
+TAP_RE = re.compile(r"/start q(\d+)_([\w-]+)")
+# The confirm question's buttons (a numbered list: answers or a note?).
+CONFIRM_BUTTONS = [("Yes, these are answers", "answers"), ("No, it's a note", "note")]
+
 # The Sheet whose runs own the Telegram chat (see the docstring above).
 TELEGRAM_SHEET_TARGET = os.getenv("TELEGRAM_SHEET_TARGET", "").strip().lower() or "real"
 telegram_on = False  # set by main(): whether this run uses Telegram
+bot_username = ""  # set by main(): the bot's name, for the links in its buttons
 
 # The calendar check runs at start and then this often.
 CALENDAR_EVERY = 3600
@@ -213,9 +224,33 @@ def plain(text):
     return re.sub(r"(?m)^#{1,6}\s+", "", text)
 
 
-def keyboard(button_list):
-    """Telegram inline keyboard: one row of (label, answer) buttons."""
-    return json.dumps({"inline_keyboard": [[{"text": label, "callback_data": value} for label, value in button_list]]})
+def question_buttons(question):
+    """The (label, answer) buttons of a stored question."""
+    if question["kind"] == "confirm":
+        return CONFIRM_BUTTONS
+    if question["kind"] == "calendar":
+        return calendar_sync.buttons(question["items"][0])
+    return [(label, value) for value, label, _ in agent.question_choices(question)]
+
+
+def keyboard(message_id, button_list):
+    """Telegram inline keyboard for a message: one row of (label, answer)
+    buttons, each a link that sends the answer as a message (TAP_RE)."""
+    return json.dumps({"inline_keyboard": [[
+        {"text": label, "url": f"https://t.me/{bot_username}?start=q{message_id}_{value}"}
+        for label, value in button_list]]})
+
+
+def set_buttons(chat_id, message_id, button_list):
+    """Put these buttons on a sent message (none: take its buttons away). The
+    links hold the message id, so they can only be added after sending."""
+    data = {"chat_id": chat_id, "message_id": message_id}
+    if button_list:
+        data["reply_markup"] = keyboard(message_id, button_list)
+    reply = telegram("editMessageReplyMarkup", data)
+    if not reply.get("ok"):
+        print(f"Could not set the buttons of message {message_id}: {reply.get('description')}")
+    return bool(reply.get("ok"))
 
 
 def telegram(method, data, attempts=retry.ATTEMPTS):
@@ -230,13 +265,11 @@ def telegram(method, data, attempts=retry.ATTEMPTS):
         return {"ok": False, "description": f"Telegram could not be reached ({retry.describe(err)})"}
 
 
-def send(chat_id, text, question=None, buttons=None):
-    """Send a message, with inline buttons if given. If `question` is given, it
-    is stored as an open question under the sent message's id, so a reply or a
-    button tap answers it. A same-name question gets its buttons here.
+def send(chat_id, text, question=None):
+    """Send a message. If `question` is given, it is stored as an open question
+    under the sent message's id, so a reply or a button tap answers it, and the
+    message gets that question's buttons.
     Returns the message id (None if sending failed)."""
-    if buttons is None and question:
-        buttons = [(label, value) for value, label, _ in agent.question_choices(question)] or None
     text = plain(text)
     if not telegram_on:
         # Not stored as a question either: no message could ever answer it.
@@ -244,19 +277,22 @@ def send(chat_id, text, question=None, buttons=None):
         return None
     if len(text) > TELEGRAM_MAX_LEN:
         text = text[: TELEGRAM_MAX_LEN - 20] + "\n\n[...cut off]"
-    data = {"chat_id": chat_id, "text": text}
-    if buttons:
-        data["reply_markup"] = keyboard(buttons)
-    reply = telegram("sendMessage", data)
+    reply = telegram("sendMessage", {"chat_id": chat_id, "text": text})
     if not reply.get("ok"):
         print(f"Could not send reply: {reply.get('description')}")
         run_errors.append(f"Telegram sendMessage: {reply.get('description')}")
         return None
     message_id = reply["result"]["message_id"]
     if question is not None:
+        buttons = question_buttons(question)
+        question["links"] = True
         questions = load_questions()
         questions[str(message_id)] = question
         save_questions(questions)
+        # Stored first, so a tap always finds its question. If this fails, a
+        # reply in words still answers it.
+        if buttons and not set_buttons(chat_id, message_id, buttons):
+            run_errors.append(f"Telegram buttons of message {message_id} not set")
     return message_id
 
 
@@ -281,7 +317,7 @@ def send_calendar_questions(chat_id, items):
     group = agent.now().strftime("%Y%m%d%H%M%S")
     for n, item in enumerate(items, 1):
         text = calendar_sync.single_question(item, n, len(items))
-        send(chat_id, text, buttons=calendar_sync.buttons(item), question={
+        send(chat_id, text, question={
             "kind": "calendar", "items": [item], "group": group, "number": n, "of": len(items), "text": text})
 
 
@@ -298,6 +334,20 @@ def migrate_batches(chat_id):
         questions = load_questions()
 
 
+def migrate_buttons(chat_id):
+    """Questions sent with callback buttons: swap them for link buttons in
+    place, so they can still be answered. Tried once per question."""
+    questions = load_questions()
+    old = {mid: q for mid, q in questions.items() if not q.get("links")}
+    for mid, q in old.items():
+        if question_buttons(q):
+            set_buttons(chat_id, int(mid), question_buttons(q))
+        q["links"] = True
+    if old:
+        save_questions(questions)
+        print(f"Buttons of {len(old)} open question(s) changed to links.")
+
+
 def show_typing(chat_id):
     # The agent takes a while; this shows "typing..." in Telegram meanwhile.
     reply = telegram("sendChatAction", {"chat_id": chat_id, "action": "typing"}, attempts=1)
@@ -312,7 +362,8 @@ def finish(writer, data, run):
     if run["asked"]:
         text = "Question before I change anything (nothing was written):\n\n" + run["question"]
         if run["person"] or run["duplicate"]:
-            text += "\n\nTap a button, or reply to this message in words, or reply /skip to drop the question."
+            text += ("\n\nTap a button (it is handled at the next check, within 30 minutes), or reply to this "
+                     "message in words, or reply /skip to drop the question.")
             return text, {"kind": "note", "pending": run["pending"], "person": run["person"],
                           "duplicate": run["duplicate"], "text": text}
         text += "\n\nReply to this message with your answer, or reply /skip to drop the question."
@@ -401,27 +452,23 @@ def answer_group(client, writer, chat_id, group, text, answers=None):
     return reply
 
 
-def handle_tap(client, writer, callback):
-    """A button tap on one of the bot's messages."""
-    message = callback.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    question_id = str(message.get("message_id", ""))
-    value = callback.get("data", "")
+def handle_tap(client, writer, chat_id, question_id, value, callback=None):
+    """A button tap: a link's /start message, or, for a message still carrying
+    an old callback button, `callback` (the tap arrived within 150 seconds)."""
     question = load_questions().get(question_id)
     if question is None:
         # Answered already, or never stored here. Say so and take the buttons
         # away, so the tap is never lost without a word.
-        shown = message.get("text", "")
-        print(f"\nButton {value!r} on message {question_id}: no open question with that id. "
-              f"Message: {shown[:200]!r}")
-        acknowledge(callback["id"], "This question is not open any more.")
-        if shown:
-            edit(chat_id, int(question_id), f"{shown}\n\n(Closed: this question is not open any more.)")
+        print(f"\nButton {value!r} on message {question_id}: no open question with that id.")
+        if callback:
+            acknowledge(callback["id"], "This question is not open any more.")
+        set_buttons(chat_id, int(question_id), [])
         send(chat_id, "That button belongs to a question that is not open any more, so nothing was changed. "
                       "If it still matters, send it to me as a message.")
         return
     print(f"\nButton {value!r} on question {question_id}")
-    acknowledge(callback["id"])
+    if callback:
+        acknowledge(callback["id"])
     try:
         if question["kind"] == "confirm":
             questions = load_questions()
@@ -473,6 +520,17 @@ def handle(client, writer, message):
         send(chat_id, "I can only read text messages for now.")
         return
 
+    tap = TAP_RE.fullmatch(text.strip())
+    if tap:
+        handle_tap(client, writer, chat_id, tap[1], tap[2])
+        return
+    # Any other /start (an old link, Telegram's own Start button) is never a
+    # note and never an answer to a question.
+    if text.split(maxsplit=1)[0].split("@")[0].lower() == "/start":
+        print(f"\nIgnored as a note: {text!r}")
+        send(chat_id, "That is a start command, not a note, so nothing was changed.")
+        return
+
     reply_to = str(message.get("reply_to_message", {}).get("message_id", ""))
     question = load_questions().get(reply_to) if reply_to else None
     if question is None and text.strip().lower() == "/skip":
@@ -485,8 +543,7 @@ def handle(client, writer, message):
             # Looks like answers to the open calendar questions: ask, don't guess.
             q_text = (f"This looks like answers to the {len(open_questions)} open calendar question(s). "
                       "Is it? (If not, I'll treat it as a note.)")
-            send(chat_id, q_text, buttons=[("Yes, these are answers", "answers"), ("No, it's a note", "note")],
-                 question={"kind": "confirm", "text": text, "group": group, "question": q_text})
+            send(chat_id, q_text, question={"kind": "confirm", "text": text, "group": group, "question": q_text})
             return
 
     print(f"\nNote: {text}" if question is None else f"\nAnswer to question {reply_to}: {text}")
@@ -556,7 +613,8 @@ def handle_update(client, writer, update):
         if chat_id != ALLOWED_CHAT_ID or callback.get("from", {}).get("id") != ALLOWED_CHAT_ID:
             print(f"Ignored a button tap from chat {chat_id}.")
             return
-        handle_tap(client, writer, callback)
+        handle_tap(client, writer, chat_id, str(callback.get("message", {}).get("message_id", "")),
+                   callback.get("data", ""), callback)
         return
 
     # Edited messages are skipped: re-running the agent on an edit
@@ -634,7 +692,7 @@ def main(reason_prefix="", calendar=None, once=False, force=False, scheduled=Fal
     bot (two pollers would take each other's messages).
     scheduled=True (with once) does nothing when scheduled_skip says so.
     """
-    global calendar_active, telegram_on
+    global calendar_active, telegram_on, bot_username
     calendar = calendar_active = CALENDAR_SYNC if calendar is None else calendar
     telegram_on = agent.sheets.SHEET_TARGET == TELEGRAM_SHEET_TARGET
     if not telegram_on and not once:
@@ -656,7 +714,8 @@ def main(reason_prefix="", calendar=None, once=False, force=False, scheduled=Fal
     me = retry.call("Telegram getMe", lambda: requests.get(f"{API}/getMe", timeout=30).json(), attempts=10**9)
     if not me.get("ok"):
         sys.exit(f"Telegram rejected the token: {me.get('description')}")
-    print(f"Connected as @{me['result']['username']}. Only answering chat {ALLOWED_CHAT_ID}.")
+    bot_username = me["result"]["username"]
+    print(f"Connected as @{bot_username}. Only answering chat {ALLOWED_CHAT_ID}.")
     print(f"Writing to the {agent.sheets.SHEET_TARGET} Sheet ({agent.sheets.SHEET_ID}).")
     print(f"Code version: {code_version()}")
     print(f"Calendar check: {'on' if calendar else 'off (set CALENDAR_SYNC=on to turn it on)'}")
@@ -668,6 +727,7 @@ def main(reason_prefix="", calendar=None, once=False, force=False, scheduled=Fal
     writer.reason_prefix = reason_prefix
     if telegram_on:
         migrate_batches(ALLOWED_CHAT_ID)
+        migrate_buttons(ALLOWED_CHAT_ID)
     if once:
         handled = run_once(client, writer, calendar)
         if not run_errors:
